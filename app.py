@@ -15,81 +15,169 @@ st.title("📈 RSI 타겟 가격 계산기")
 st.caption("종목/지수를 입력하면 현재 RSI와 타겟 RSI 달성에 필요한 가격 및 등락률을 계산합니다.")
 
 
-def calculate_rsi(prices: pd.Series, period: int = 14):
-    """단순 이동평균(SMA) 방식으로 RSI 계산."""
-    delta = prices.diff()
-    gain = delta.clip(lower=0)
-    loss = -delta.clip(upper=0)
+# ── RSI 계산 함수 ────────────────────────────────────────────────────────────────
 
+def _gains_losses(prices: pd.Series):
+    delta = prices.diff()
+    return delta.clip(lower=0), -delta.clip(upper=0)
+
+
+def calc_rsi_wilder(prices: pd.Series, period: int):
+    """Wilder's Smoothing (표준 RSI): alpha = 1/period"""
+    gain, loss = _gains_losses(prices)
+    avg_gain = gain.ewm(alpha=1 / period, min_periods=period, adjust=False).mean()
+    avg_loss = loss.ewm(alpha=1 / period, min_periods=period, adjust=False).mean()
+    rs = avg_gain / avg_loss
+    rsi = 100 - 100 / (1 + rs)
+    return rsi, avg_gain, avg_loss
+
+
+def calc_rsi_sma(prices: pd.Series, period: int):
+    """Cutler's RSI (SMA): 단순 이동평균"""
+    gain, loss = _gains_losses(prices)
     avg_gain = gain.rolling(window=period).mean()
     avg_loss = loss.rolling(window=period).mean()
-
-    # 다음 봉 역산에 필요한 현재 윈도우의 가장 오래된 값
     oldest_gain = gain.shift(period - 1)
     oldest_loss = loss.shift(period - 1)
-
     rs = avg_gain / avg_loss
-    rsi = 100 - (100 / (1 + rs))
+    rsi = 100 - 100 / (1 + rs)
     return rsi, avg_gain, avg_loss, oldest_gain, oldest_loss
 
 
-def target_price_for_rsi(
-    current_price: float,
-    avg_gain: float,
-    avg_loss: float,
-    oldest_gain: float,
-    oldest_loss: float,
-    target_rsi: float,
-    period: int = 14,
+def calc_rsi_ema(prices: pd.Series, period: int):
+    """EMA RSI: span = period (alpha = 2/(period+1))"""
+    gain, loss = _gains_losses(prices)
+    avg_gain = gain.ewm(span=period, min_periods=period, adjust=False).mean()
+    avg_loss = loss.ewm(span=period, min_periods=period, adjust=False).mean()
+    rs = avg_gain / avg_loss
+    rsi = 100 - 100 / (1 + rs)
+    return rsi, avg_gain, avg_loss
+
+
+# ── 타겟 가격 역산 함수 ──────────────────────────────────────────────────────────
+
+def _current_rsi(avg_gain: float, avg_loss: float) -> float:
+    if avg_loss == 0:
+        return 100.0
+    if avg_gain == 0:
+        return 0.0
+    return 100 - 100 / (1 + avg_gain / avg_loss)
+
+
+def target_wilder(
+    current_price: float, avg_gain: float, avg_loss: float,
+    target_rsi: float, period: int,
 ) -> float | None:
     """
-    SMA 방식에서 다음 봉 하나로 target_rsi 에 도달하는 가격을 역산.
+    Wilder: avg_new = avg_prev*(n-1)/n + new_val/n
 
-    SMA rolling: avg_new = (avg_prev * n - oldest + new_val) / n
-
-    target_rs = target_rsi / (100 - target_rsi)
-    sum_gain = avg_gain * n,  sum_loss = avg_loss * n
-
-    [상승 케이스] new_gain = P - current_price, new_loss = 0
-        avg_gain_new = (sum_gain - oldest_gain + P - current_price) / n
-        avg_loss_new = (sum_loss - oldest_loss) / n
-        -> P = current_price + target_rs*(sum_loss - oldest_loss) - sum_gain + oldest_gain
-
-    [하락 케이스] new_gain = 0, new_loss = current_price - P
-        avg_gain_new = (sum_gain - oldest_gain) / n
-        avg_loss_new = (sum_loss - oldest_loss + current_price - P) / n
-        -> P = current_price + sum_loss - oldest_loss - (sum_gain - oldest_gain) / target_rs
+    Up:   P = P_cur + (n-1)*(RS_t * avg_loss - avg_gain)
+    Down: P = P_cur + (n-1)*(avg_loss - avg_gain / RS_t)
     """
     if target_rsi <= 0 or target_rsi >= 100:
         return None
-
     n = period
-    target_rs = target_rsi / (100 - target_rsi)
-
-    sum_gain = avg_gain * n
-    sum_loss = avg_loss * n
-
-    # 현재 RSI
-    if avg_loss == 0:
-        current_rsi = 100.0
-    elif avg_gain == 0:
-        current_rsi = 0.0
+    rs_t = target_rsi / (100 - target_rsi)
+    cur = _current_rsi(avg_gain, avg_loss)
+    if target_rsi >= cur:
+        return current_price + (n - 1) * (rs_t * avg_loss - avg_gain)
     else:
-        current_rsi = 100 - 100 / (1 + avg_gain / avg_loss)
-
-    if target_rsi >= current_rsi:
-        # 상승 케이스
-        price = current_price + target_rs * (sum_loss - oldest_loss) - sum_gain + oldest_gain
-    else:
-        # 하락 케이스
-        if target_rs == 0:
+        if rs_t == 0:
             return None
-        price = current_price + (sum_loss - oldest_loss) - (sum_gain - oldest_gain) / target_rs
-
-    return price
+        return current_price + (n - 1) * (avg_loss - avg_gain / rs_t)
 
 
-# ── 사이드바: 입력 ──────────────────────────────────────────────────────────────
+def target_sma(
+    current_price: float, avg_gain: float, avg_loss: float,
+    oldest_gain: float, oldest_loss: float,
+    target_rsi: float, period: int,
+) -> float | None:
+    """
+    SMA: avg_new = (avg_prev*n - oldest + new_val) / n
+    ΣG = avg_gain*n,  ΣL = avg_loss*n
+
+    Up:   P = P_cur + RS_t*(ΣL - L_old) - ΣG + G_old
+    Down: P = P_cur + (ΣL - L_old) - (ΣG - G_old) / RS_t
+    """
+    if target_rsi <= 0 or target_rsi >= 100:
+        return None
+    n = period
+    rs_t = target_rsi / (100 - target_rsi)
+    sg = avg_gain * n
+    sl = avg_loss * n
+    cur = _current_rsi(avg_gain, avg_loss)
+    if target_rsi >= cur:
+        return current_price + rs_t * (sl - oldest_loss) - sg + oldest_gain
+    else:
+        if rs_t == 0:
+            return None
+        return current_price + (sl - oldest_loss) - (sg - oldest_gain) / rs_t
+
+
+def target_ema(
+    current_price: float, avg_gain: float, avg_loss: float,
+    target_rsi: float, period: int,
+) -> float | None:
+    """
+    EMA: alpha = 2/(n+1),  avg_new = avg_prev*(n-1)/(n+1) + new_val*2/(n+1)
+
+    Up:   P = P_cur + (n-1)/2 * (RS_t * avg_loss - avg_gain)
+    Down: P = P_cur + (n-1)/2 * (avg_loss - avg_gain / RS_t)
+    """
+    if target_rsi <= 0 or target_rsi >= 100:
+        return None
+    n = period
+    rs_t = target_rsi / (100 - target_rsi)
+    k = (n - 1) / 2
+    cur = _current_rsi(avg_gain, avg_loss)
+    if target_rsi >= cur:
+        return current_price + k * (rs_t * avg_loss - avg_gain)
+    else:
+        if rs_t == 0:
+            return None
+        return current_price + k * (avg_loss - avg_gain / rs_t)
+
+
+# ── 공통 유틸 ─────────────────────────────────────────────────────────────────
+
+def build_table(
+    target_rsi_list, current_price, current_rsi, calc_fn
+) -> pd.DataFrame:
+    rows = []
+    for t_rsi in target_rsi_list:
+        t_price = calc_fn(t_rsi)
+        if t_price is None or t_price <= 0:
+            rows.append({"타겟 RSI": t_rsi, "예상 가격": None, "등락률 (%)": None, "방향": "-"})
+        else:
+            pct = (t_price - current_price) / current_price * 100
+            direction = "▲ 상승" if t_price > current_price else ("▼ 하락" if t_price < current_price else "─")
+            rows.append({
+                "타겟 RSI": t_rsi,
+                "예상 가격": round(t_price, 4),
+                "등락률 (%)": round(pct, 2),
+                "방향": direction,
+            })
+    return pd.DataFrame(rows)
+
+
+def style_table(df: pd.DataFrame):
+    def _row(row):
+        rsi = row["타겟 RSI"]
+        if rsi <= 30:
+            return ["color: #4fc3f7"] * len(row)
+        if rsi >= 70:
+            return ["color: #ef9a9a"] * len(row)
+        return [""] * len(row)
+
+    return df.style.apply(_row, axis=1).format(
+        {"예상 가격": lambda v: f"{v:,.4g}" if v is not None else "계산 불가",
+         "등락률 (%)": lambda v: f"{v:+.2f}%" if v is not None else "-"},
+        na_rep="-",
+    )
+
+
+# ── 사이드바 ──────────────────────────────────────────────────────────────────
+
 with st.sidebar:
     st.header("설정")
 
@@ -100,30 +188,18 @@ with st.sidebar:
     )
 
     period_rsi = st.number_input(
-        "RSI 기간 (봉 수)",
-        min_value=2,
-        max_value=50,
-        value=14,
-        step=1,
+        "RSI 기간 (봉 수)", min_value=2, max_value=50, value=14, step=1,
     )
 
     interval_options = {
-        "일봉": "1d",
-        "주봉": "1wk",
-        "월봉": "1mo",
-        "1시간": "1h",
-        "4시간": "4h",
-        "15분": "15m",
+        "일봉": "1d", "주봉": "1wk", "월봉": "1mo",
+        "1시간": "1h", "4시간": "4h", "15분": "15m",
     }
     interval_label = st.selectbox("차트 간격", list(interval_options.keys()), index=0)
     interval = interval_options[interval_label]
 
     lookback_options = {
-        "3개월": "3mo",
-        "6개월": "6mo",
-        "1년": "1y",
-        "2년": "2y",
-        "5년": "5y",
+        "3개월": "3mo", "6개월": "6mo", "1년": "1y", "2년": "2y", "5년": "5y",
     }
     lookback_label = st.selectbox("조회 기간", list(lookback_options.keys()), index=1)
     lookback = lookback_options[lookback_label]
@@ -137,7 +213,8 @@ with st.sidebar:
 
     run_btn = st.button("계산하기", type="primary", use_container_width=True)
 
-# ── 메인: 계산 및 출력 ──────────────────────────────────────────────────────────
+# ── 메인 ──────────────────────────────────────────────────────────────────────
+
 if run_btn or ticker_input:
     try:
         target_rsi_list = sorted(
@@ -149,183 +226,135 @@ if run_btn or ticker_input:
 
     with st.spinner(f"{ticker_input} 데이터 로딩 중..."):
         try:
-            ticker_obj = yf.Ticker(ticker_input)
-            hist = ticker_obj.history(period=lookback, interval=interval)
+            hist = yf.Ticker(ticker_input).history(period=lookback, interval=interval)
         except Exception as e:
             st.error(f"데이터 로딩 실패: {e}")
             st.stop()
 
     if hist.empty:
-        st.error(f"'{ticker_input}' 에 대한 데이터를 가져오지 못했습니다. 심볼을 확인해주세요.")
+        st.error(f"'{ticker_input}' 데이터를 가져오지 못했습니다. 심볼을 확인해주세요.")
         st.stop()
 
     close = hist["Close"].dropna()
 
     if len(close) < period_rsi + 1:
-        st.error(f"데이터가 부족합니다. 최소 {period_rsi + 1}개 봉이 필요합니다.")
+        st.error(f"데이터 부족. 최소 {period_rsi + 1}개 봉이 필요합니다.")
         st.stop()
 
-    rsi_series, avg_gain_series, avg_loss_series, oldest_gain_series, oldest_loss_series = calculate_rsi(close, period=period_rsi)
+    # 세 방식 계산
+    rsi_w, ag_w, al_w = calc_rsi_wilder(close, period_rsi)
+    rsi_s, ag_s, al_s, og_s, ol_s = calc_rsi_sma(close, period_rsi)
+    rsi_e, ag_e, al_e = calc_rsi_ema(close, period_rsi)
 
     current_price = float(close.iloc[-1])
-    current_rsi = float(rsi_series.iloc[-1])
-    last_avg_gain = float(avg_gain_series.iloc[-1])
-    last_avg_loss = float(avg_loss_series.iloc[-1])
-    last_oldest_gain = float(oldest_gain_series.iloc[-1])
-    last_oldest_loss = float(oldest_loss_series.iloc[-1])
     last_date = close.index[-1]
+    date_str = last_date.strftime("%Y-%m-%d") if hasattr(last_date, "strftime") else str(last_date)
 
-    # ── 현재 상태 카드 ─────────────────────────────────────────────────────────
-    st.subheader(f"{ticker_input.upper()}  |  {interval_label}  |  {last_date.strftime('%Y-%m-%d') if hasattr(last_date, 'strftime') else last_date}")
+    cr_w = float(rsi_w.iloc[-1])
+    cr_s = float(rsi_s.iloc[-1])
+    cr_e = float(rsi_e.iloc[-1])
 
-    col1, col2, col3 = st.columns(3)
-    with col1:
+    # ── 헤더 ────────────────────────────────────────────────────────────────
+    st.subheader(f"{ticker_input.upper()}  |  {interval_label}  |  {date_str}")
+
+    c0, c1, c2, c3 = st.columns(4)
+    with c0:
         st.metric("현재 가격", f"{current_price:,.4g}")
-    with col2:
-        rsi_color = (
-            "🔴 과매수" if current_rsi >= 70
-            else "🟢 과매도" if current_rsi <= 30
-            else "⚪ 중립"
-        )
-        st.metric("현재 RSI", f"{current_rsi:.2f}", rsi_color)
-    with col3:
-        st.metric("RSI 기간", f"{period_rsi}봉")
 
-    # ── 타겟 RSI 테이블 ────────────────────────────────────────────────────────
+    def rsi_label(v):
+        if v >= 70:
+            return "🔴 과매수"
+        if v <= 30:
+            return "🟢 과매도"
+        return "⚪ 중립"
+
+    with c1:
+        st.metric("Wilder RSI", f"{cr_w:.2f}", rsi_label(cr_w))
+    with c2:
+        st.metric("Cutler RSI (SMA)", f"{cr_s:.2f}", rsi_label(cr_s))
+    with c3:
+        st.metric("EMA RSI", f"{cr_e:.2f}", rsi_label(cr_e))
+
+    # ── 타겟 가격 테이블 (탭) ─────────────────────────────────────────────
     st.subheader("타겟 RSI별 예상 가격")
-
-    rows = []
-    for t_rsi in target_rsi_list:
-        t_price = target_price_for_rsi(
-            current_price, last_avg_gain, last_avg_loss,
-            last_oldest_gain, last_oldest_loss, t_rsi, period=period_rsi
-        )
-        if t_price is None or t_price <= 0:
-            rows.append(
-                {
-                    "타겟 RSI": t_rsi,
-                    "예상 가격": "계산 불가",
-                    "등락률 (%)": "-",
-                    "방향": "-",
-                }
-            )
-        else:
-            pct = (t_price - current_price) / current_price * 100
-            direction = "▲ 상승" if t_price > current_price else ("▼ 하락" if t_price < current_price else "─ 현재")
-            rows.append(
-                {
-                    "타겟 RSI": t_rsi,
-                    "예상 가격": round(t_price, 4),
-                    "등락률 (%)": round(pct, 2),
-                    "방향": direction,
-                }
-            )
-
-    df_table = pd.DataFrame(rows)
-
-    def highlight_row(row):
-        rsi = row["타겟 RSI"]
-        diff = abs(rsi - current_rsi)
-        if diff < 1e-6:
-            return ["background-color: #444"] * len(row)
-        if rsi <= 30:
-            return ["color: #4fc3f7"] * len(row)
-        if rsi >= 70:
-            return ["color: #ef9a9a"] * len(row)
-        return [""] * len(row)
-
-    st.dataframe(
-        df_table.style.apply(highlight_row, axis=1),
-        use_container_width=True,
-        hide_index=True,
+    tab_w, tab_s, tab_e = st.tabs(
+        ["📊 Wilder (표준)", "📊 Cutler (SMA)", "📊 EMA RSI"]
     )
 
-    # ── 차트 ──────────────────────────────────────────────────────────────────
+    with tab_w:
+        df_w = build_table(
+            target_rsi_list, current_price, cr_w,
+            lambda t: target_wilder(current_price, float(ag_w.iloc[-1]), float(al_w.iloc[-1]), t, period_rsi),
+        )
+        st.dataframe(style_table(df_w), use_container_width=True, hide_index=True)
+
+    with tab_s:
+        df_s = build_table(
+            target_rsi_list, current_price, cr_s,
+            lambda t: target_sma(
+                current_price, float(ag_s.iloc[-1]), float(al_s.iloc[-1]),
+                float(og_s.iloc[-1]), float(ol_s.iloc[-1]), t, period_rsi,
+            ),
+        )
+        st.dataframe(style_table(df_s), use_container_width=True, hide_index=True)
+
+    with tab_e:
+        df_e = build_table(
+            target_rsi_list, current_price, cr_e,
+            lambda t: target_ema(current_price, float(ag_e.iloc[-1]), float(al_e.iloc[-1]), t, period_rsi),
+        )
+        st.dataframe(style_table(df_e), use_container_width=True, hide_index=True)
+
+    # ── 차트 ──────────────────────────────────────────────────────────────
     st.subheader("차트")
 
     fig = make_subplots(
-        rows=2,
-        cols=1,
+        rows=2, cols=1,
         shared_xaxes=True,
-        row_heights=[0.65, 0.35],
+        row_heights=[0.6, 0.4],
         vertical_spacing=0.04,
     )
 
-    # 가격 캔들차트
+    # 캔들차트
     fig.add_trace(
         go.Candlestick(
             x=hist.index,
-            open=hist["Open"],
-            high=hist["High"],
-            low=hist["Low"],
-            close=hist["Close"],
+            open=hist["Open"], high=hist["High"],
+            low=hist["Low"], close=hist["Close"],
             name="가격",
             increasing_line_color="#26a69a",
             decreasing_line_color="#ef5350",
         ),
-        row=1,
-        col=1,
+        row=1, col=1,
     )
 
-    # 타겟 가격 수평선
-    for row in rows:
-        if isinstance(row["예상 가격"], (int, float)):
-            t_rsi = row["타겟 RSI"]
-            t_price = row["예상 가격"]
-            color = "#4fc3f7" if t_rsi <= 30 else ("#ef9a9a" if t_rsi >= 70 else "#bdbdbd")
-            fig.add_hline(
-                y=t_price,
-                line_dash="dot",
-                line_color=color,
-                line_width=1,
-                annotation_text=f"RSI {t_rsi}",
-                annotation_position="right",
-                row=1,
-                col=1,
-            )
-
-    # 현재 가격 수평선
+    # 현재가 수평선
     fig.add_hline(
-        y=current_price,
-        line_dash="solid",
-        line_color="#ffeb3b",
-        line_width=1.5,
-        annotation_text=f"현재 {current_price:,.4g}",
-        annotation_position="right",
-        row=1,
-        col=1,
+        y=current_price, line_dash="solid", line_color="#ffeb3b", line_width=1.5,
+        annotation_text=f"현재 {current_price:,.4g}", annotation_position="right",
+        row=1, col=1,
     )
 
-    # RSI 라인
-    fig.add_trace(
-        go.Scatter(
-            x=rsi_series.index,
-            y=rsi_series.values,
-            line=dict(color="#ce93d8", width=1.5),
-            name=f"RSI({period_rsi})",
-        ),
-        row=2,
-        col=1,
-    )
+    # RSI 세 라인
+    rsi_traces = [
+        (rsi_w, "#4fc3f7", f"Wilder({period_rsi})"),
+        (rsi_s, "#a5d6a7", f"Cutler SMA({period_rsi})"),
+        (rsi_e, "#ce93d8", f"EMA({period_rsi})"),
+    ]
+    for rsi_ser, color, name in rsi_traces:
+        fig.add_trace(
+            go.Scatter(x=rsi_ser.index, y=rsi_ser.values,
+                       line=dict(color=color, width=1.5), name=name),
+            row=2, col=1,
+        )
+
     fig.add_hline(y=70, line_dash="dash", line_color="#ef9a9a", line_width=1, row=2, col=1)
     fig.add_hline(y=30, line_dash="dash", line_color="#4fc3f7", line_width=1, row=2, col=1)
     fig.add_hline(y=50, line_dash="dot", line_color="#9e9e9e", line_width=1, row=2, col=1)
 
-    # 현재 RSI 표시
-    fig.add_hline(
-        y=current_rsi,
-        line_dash="solid",
-        line_color="#ffeb3b",
-        line_width=1,
-        annotation_text=f"현재 RSI {current_rsi:.1f}",
-        annotation_position="right",
-        row=2,
-        col=1,
-    )
-
     fig.update_layout(
         template="plotly_dark",
-        height=700,
+        height=750,
         xaxis_rangeslider_visible=False,
         legend=dict(orientation="h", y=1.02),
         margin=dict(l=10, r=80, t=30, b=10),
@@ -335,24 +364,39 @@ if run_btn or ticker_input:
 
     st.plotly_chart(fig, use_container_width=True)
 
-    # ── 계산 방식 설명 ─────────────────────────────────────────────────────────
+    # ── 계산 방식 설명 ─────────────────────────────────────────────────────
     with st.expander("계산 방식 설명"):
-        st.markdown(
-            f"""
-**RSI 계산**: 단순 이동평균 (SMA, 기간 = {period_rsi})
+        st.markdown(f"""
+### RSI 계산 방식 비교
 
-$$RSI = 100 - \\frac{{100}}{{1 + RS}}, \\quad RS = \\frac{{SMA_{{Gain}}(n)}}{{SMA_{{Loss}}(n)}}$$
+| 방식 | 평활화 | alpha |
+|------|--------|-------|
+| **Wilder (표준)** | EWM (adjust=False) | α = 1/{period_rsi} |
+| **Cutler (SMA)** | 단순 이동평균 | — |
+| **EMA RSI** | EWM (adjust=False) | α = 2/{period_rsi+1} |
 
-**타겟 가격 역산**: SMA rolling 윈도우에서 가장 오래된 값($G_{{old}}, L_{{old}}$)이 빠지고 새 값이 들어오는 구조를 이용합니다.
+$$RSI = 100 - \\frac{{100}}{{1 + RS}}, \\quad RS = \\frac{{\\overline{{Gain}}}}{{\\overline{{Loss}}}}$$
 
-- 상승 케이스 (P > 현재가):
-$$P = P_{{cur}} + RS_{{target}} \\cdot (\\Sigma L - L_{{old}}) - \\Sigma G + G_{{old}}$$
+---
 
-- 하락 케이스 (P < 현재가):
-$$P = P_{{cur}} + (\\Sigma L - L_{{old}}) - \\frac{{\\Sigma G - G_{{old}}}}{{RS_{{target}}}}$$
+### 타겟 가격 역산 공식
 
-여기서 $RS_{{target}} = \\dfrac{{RSI_{{target}}}}{{100 - RSI_{{target}}}}$, $\\Sigma G = SMA_{{Gain}} \\times n$, $\\Sigma L = SMA_{{Loss}} \\times n$
+다음 봉 종가 $P$ 가 타겟 RSI를 달성하는 값. $RS_t = \\dfrac{{RSI_t}}{{100 - RSI_t}}$
 
-> **주의**: 이 계산은 단일 봉 기준이며, 실제 가격은 시장 상황에 따라 달라집니다.
-"""
-        )
+**Wilder** (α = 1/n → avg_new = avg × (n-1)/n + val/n)
+
+$$P_{{\\uparrow}} = P_{{cur}} + (n-1)(RS_t \\cdot \\overline{{L}} - \\overline{{G}})$$
+$$P_{{\\downarrow}} = P_{{cur}} + (n-1)\\left(\\overline{{L}} - \\frac{{\\overline{{G}}}}{{RS_t}}\\right)$$
+
+**Cutler / SMA** (rolling window: oldest $G_0, L_0$ 이탈, $\\Sigma G = \\overline{{G}} \\cdot n$)
+
+$$P_{{\\uparrow}} = P_{{cur}} + RS_t(\\Sigma L - L_0) - \\Sigma G + G_0$$
+$$P_{{\\downarrow}} = P_{{cur}} + (\\Sigma L - L_0) - \\frac{{\\Sigma G - G_0}}{{RS_t}}$$
+
+**EMA RSI** (α = 2/(n+1) → avg_new = avg × (n-1)/(n+1) + val × 2/(n+1))
+
+$$P_{{\\uparrow}} = P_{{cur}} + \\frac{{n-1}}{{2}}(RS_t \\cdot \\overline{{L}} - \\overline{{G}})$$
+$$P_{{\\downarrow}} = P_{{cur}} + \\frac{{n-1}}{{2}}\\left(\\overline{{L}} - \\frac{{\\overline{{G}}}}{{RS_t}}\\right)$$
+
+> **주의**: 단일 봉 기준 역산이며 실제 가격은 시장 상황에 따라 달라집니다.
+""")

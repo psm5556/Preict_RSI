@@ -199,25 +199,31 @@ def style_table(df: pd.DataFrame):
 # ── 구글시트 종목 로드 ─────────────────────────────────────────────────────────
 
 @st.cache_data(ttl=600, show_spinner=False)
-def load_sheet_tickers() -> pd.DataFrame:
-    """구글시트에서 티커·기업명 목록을 읽어 DataFrame 반환."""
+def load_sheet_tickers() -> tuple[pd.DataFrame, str]:
+    """구글시트에서 티커·기업명 목록을 읽어 (DataFrame, 에러메시지) 반환."""
+    from urllib.parse import quote
     try:
         sheet_id   = st.secrets["GOOGLE_SHEET_ID"]
         sheet_name = st.secrets["GOOGLE_SHEET_NAME"]
-    except KeyError:
-        return pd.DataFrame()
+    except KeyError as e:
+        return pd.DataFrame(), f"secrets 키 없음: {e}"
+
+    encoded_name = quote(sheet_name)
     url = (
         f"https://docs.google.com/spreadsheets/d/{sheet_id}"
-        f"/gviz/tq?tqx=out:csv&sheet={sheet_name}"
+        f"/gviz/tq?tqx=out:csv&sheet={encoded_name}"
     )
     try:
         df = pd.read_csv(url)
-    except Exception:
-        return pd.DataFrame()
+    except Exception as e:
+        return pd.DataFrame(), f"CSV 읽기 실패: {e}"
+
     needed = {"티커", "기업명"}
     if not needed.issubset(df.columns):
-        return pd.DataFrame()
-    return df[["티커", "기업명"]].dropna(subset=["티커"]).reset_index(drop=True)
+        return pd.DataFrame(), f"필요한 컬럼 없음. 실제 컬럼: {list(df.columns)}"
+
+    result = df[["티커", "기업명"]].dropna(subset=["티커"]).reset_index(drop=True)
+    return result, ""
 
 
 # ── 사이드바 ──────────────────────────────────────────────────────────────────
@@ -247,9 +253,10 @@ with st.sidebar:
     if refresh_col.button("🔄 새로고침", use_container_width=True):
         st.cache_data.clear()
 
-    sheet_df = load_sheet_tickers()
+    sheet_df, sheet_err = load_sheet_tickers()
     if sheet_df.empty:
-        st.caption("종목 목록을 불러오지 못했습니다.")
+        msg = sheet_err if sheet_err else "종목 목록이 비어 있습니다."
+        st.error(msg)
     else:
         options = ["— 선택 —"] + [
             f"{row['기업명']}  ({row['티커']})" for _, row in sheet_df.iterrows()

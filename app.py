@@ -16,48 +16,58 @@ st.caption("종목/지수를 입력하면 현재 RSI와 타겟 RSI 달성에 필
 
 
 def calculate_rsi(prices: pd.Series, period: int = 14):
-    """Wilder's smoothing 방식으로 RSI 계산 (EWM alpha=1/period, adjust=False)."""
+    """단순 이동평균(SMA) 방식으로 RSI 계산."""
     delta = prices.diff()
     gain = delta.clip(lower=0)
     loss = -delta.clip(upper=0)
 
-    avg_gain = gain.ewm(alpha=1 / period, min_periods=period, adjust=False).mean()
-    avg_loss = loss.ewm(alpha=1 / period, min_periods=period, adjust=False).mean()
+    avg_gain = gain.rolling(window=period).mean()
+    avg_loss = loss.rolling(window=period).mean()
+
+    # 다음 봉 역산에 필요한 현재 윈도우의 가장 오래된 값
+    oldest_gain = gain.shift(period - 1)
+    oldest_loss = loss.shift(period - 1)
 
     rs = avg_gain / avg_loss
     rsi = 100 - (100 / (1 + rs))
-    return rsi, avg_gain, avg_loss
+    return rsi, avg_gain, avg_loss, oldest_gain, oldest_loss
 
 
 def target_price_for_rsi(
     current_price: float,
     avg_gain: float,
     avg_loss: float,
+    oldest_gain: float,
+    oldest_loss: float,
     target_rsi: float,
     period: int = 14,
 ) -> float | None:
     """
-    현재 avg_gain, avg_loss 에서 다음 봉 하나로 target_rsi 에 도달하는 가격을 역산.
+    SMA 방식에서 다음 봉 하나로 target_rsi 에 도달하는 가격을 역산.
 
-    Wilder's: avg_new = avg_prev * (n-1)/n + current_value / n
+    SMA rolling: avg_new = (avg_prev * n - oldest + new_val) / n
 
     target_rs = target_rsi / (100 - target_rsi)
+    sum_gain = avg_gain * n,  sum_loss = avg_loss * n
 
-    [상승 케이스] gain = P - current_price, loss = 0
-        avg_gain_new = (avg_gain*(n-1) + gain) / n
-        avg_loss_new = avg_loss*(n-1) / n
-        -> P = current_price + (n-1)*(target_rs * avg_loss - avg_gain)
+    [상승 케이스] new_gain = P - current_price, new_loss = 0
+        avg_gain_new = (sum_gain - oldest_gain + P - current_price) / n
+        avg_loss_new = (sum_loss - oldest_loss) / n
+        -> P = current_price + target_rs*(sum_loss - oldest_loss) - sum_gain + oldest_gain
 
-    [하락 케이스] gain = 0, loss = current_price - P
-        avg_gain_new = avg_gain*(n-1) / n
-        avg_loss_new = (avg_loss*(n-1) + loss) / n
-        -> P = current_price + (n-1)*(avg_loss - avg_gain / target_rs)
+    [하락 케이스] new_gain = 0, new_loss = current_price - P
+        avg_gain_new = (sum_gain - oldest_gain) / n
+        avg_loss_new = (sum_loss - oldest_loss + current_price - P) / n
+        -> P = current_price + sum_loss - oldest_loss - (sum_gain - oldest_gain) / target_rs
     """
     if target_rsi <= 0 or target_rsi >= 100:
         return None
 
     n = period
     target_rs = target_rsi / (100 - target_rsi)
+
+    sum_gain = avg_gain * n
+    sum_loss = avg_loss * n
 
     # 현재 RSI
     if avg_loss == 0:
@@ -69,12 +79,12 @@ def target_price_for_rsi(
 
     if target_rsi >= current_rsi:
         # 상승 케이스
-        price = current_price + (n - 1) * (target_rs * avg_loss - avg_gain)
+        price = current_price + target_rs * (sum_loss - oldest_loss) - sum_gain + oldest_gain
     else:
         # 하락 케이스
         if target_rs == 0:
             return None
-        price = current_price + (n - 1) * (avg_loss - avg_gain / target_rs)
+        price = current_price + (sum_loss - oldest_loss) - (sum_gain - oldest_gain) / target_rs
 
     return price
 
@@ -155,12 +165,14 @@ if run_btn or ticker_input:
         st.error(f"데이터가 부족합니다. 최소 {period_rsi + 1}개 봉이 필요합니다.")
         st.stop()
 
-    rsi_series, avg_gain_series, avg_loss_series = calculate_rsi(close, period=period_rsi)
+    rsi_series, avg_gain_series, avg_loss_series, oldest_gain_series, oldest_loss_series = calculate_rsi(close, period=period_rsi)
 
     current_price = float(close.iloc[-1])
     current_rsi = float(rsi_series.iloc[-1])
     last_avg_gain = float(avg_gain_series.iloc[-1])
     last_avg_loss = float(avg_loss_series.iloc[-1])
+    last_oldest_gain = float(oldest_gain_series.iloc[-1])
+    last_oldest_loss = float(oldest_loss_series.iloc[-1])
     last_date = close.index[-1]
 
     # ── 현재 상태 카드 ─────────────────────────────────────────────────────────
@@ -185,7 +197,8 @@ if run_btn or ticker_input:
     rows = []
     for t_rsi in target_rsi_list:
         t_price = target_price_for_rsi(
-            current_price, last_avg_gain, last_avg_loss, t_rsi, period=period_rsi
+            current_price, last_avg_gain, last_avg_loss,
+            last_oldest_gain, last_oldest_loss, t_rsi, period=period_rsi
         )
         if t_price is None or t_price <= 0:
             rows.append(
@@ -326,19 +339,19 @@ if run_btn or ticker_input:
     with st.expander("계산 방식 설명"):
         st.markdown(
             f"""
-**RSI 계산**: Wilder's Smoothing (EWM, α = 1/{period_rsi})
+**RSI 계산**: 단순 이동평균 (SMA, 기간 = {period_rsi})
 
-$$RSI = 100 - \\frac{{100}}{{1 + RS}}, \\quad RS = \\frac{{\\overline{{Gain}}_{{n}}}}{{\\overline{{Loss}}_{{n}}}}$$
+$$RSI = 100 - \\frac{{100}}{{1 + RS}}, \\quad RS = \\frac{{SMA_{{Gain}}(n)}}{{SMA_{{Loss}}(n)}}$$
 
-**타겟 가격 역산**: 다음 봉 종가 P 가 타겟 RSI를 달성하는 값을 다음 연립방정식으로 풀이합니다.
+**타겟 가격 역산**: SMA rolling 윈도우에서 가장 오래된 값($G_{{old}}, L_{{old}}$)이 빠지고 새 값이 들어오는 구조를 이용합니다.
 
 - 상승 케이스 (P > 현재가):
-$$P = P_{{cur}} + (n-1)(RS_{{target}} \\cdot \\overline{{Loss}} - \\overline{{Gain}})$$
+$$P = P_{{cur}} + RS_{{target}} \\cdot (\\Sigma L - L_{{old}}) - \\Sigma G + G_{{old}}$$
 
 - 하락 케이스 (P < 현재가):
-$$P = P_{{cur}} + (n-1)\\left(\\overline{{Loss}} - \\frac{{\\overline{{Gain}}}}{{RS_{{target}}}}\\right)$$
+$$P = P_{{cur}} + (\\Sigma L - L_{{old}}) - \\frac{{\\Sigma G - G_{{old}}}}{{RS_{{target}}}}$$
 
-여기서 $RS_{{target}} = \\dfrac{{RSI_{{target}}}}{{100 - RSI_{{target}}}}$
+여기서 $RS_{{target}} = \\dfrac{{RSI_{{target}}}}{{100 - RSI_{{target}}}}$, $\\Sigma G = SMA_{{Gain}} \\times n$, $\\Sigma L = SMA_{{Loss}} \\times n$
 
 > **주의**: 이 계산은 단일 봉 기준이며, 실제 가격은 시장 상황에 따라 달라집니다.
 """

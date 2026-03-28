@@ -264,11 +264,11 @@ if run_btn or ticker_input:
     rsi_s, ag_s, al_s, og_s, ol_s = calc_rsi_sma(close, period_rsi)
     rsi_e, ag_e, al_e = calc_rsi_ema(close, period_rsi)
 
-    # 기간 내 RSI min/max (세 방식 통합, 1 단위 반올림)
-    import math
-    rsi_period_min = math.floor(min(rsi_w.min(), rsi_s.min(), rsi_e.min()))
-    rsi_period_max = math.ceil(max(rsi_w.max(), rsi_s.max(), rsi_e.max()))
-    target_rsi_list = sorted({float(rsi_period_min), *map(float, FIXED_RSI), float(rsi_period_max)})
+    # 방식별 기간 내 RSI min/max (반올림 없이 실제값 사용)
+    def make_target_list(rsi_series):
+        mn = float(rsi_series.dropna().min())
+        mx = float(rsi_series.dropna().max())
+        return sorted({mn, *map(float, FIXED_RSI), mx})
 
     current_price = float(close.iloc[-1])
     last_date = close.index[-1]
@@ -301,24 +301,30 @@ if run_btn or ticker_input:
 
     # ── 타겟 가격 테이블 (탭) ─────────────────────────────────────────────
     st.subheader("타겟 RSI별 예상 가격")
-    st.caption(
-        f"타겟 목록: {', '.join(str(int(v)) if v == int(v) else str(v) for v in target_rsi_list)}"
-        f"  (고정: 25·30·50·70·75 + 기간 min **{rsi_period_min}** / max **{rsi_period_max}**)"
-    )
+
+    def fmt_list(lst):
+        return ", ".join(f"{v:.2f}" if v != int(v) else str(int(v)) for v in lst)
+
+    tl_w = make_target_list(rsi_w)
+    tl_s = make_target_list(rsi_s)
+    tl_e = make_target_list(rsi_e)
+
     tab_w, tab_s, tab_e = st.tabs(
         ["📊 Wilder (표준)", "📊 Cutler (SMA)", "📊 EMA RSI"]
     )
 
     with tab_w:
+        st.caption(f"타겟 목록: {fmt_list(tl_w)}  (기간 min **{tl_w[0]:.2f}** / max **{tl_w[-1]:.2f}**)")
         df_w = build_table(
-            target_rsi_list, current_price, cr_w,
+            tl_w, current_price, cr_w,
             lambda t: target_wilder(current_price, float(ag_w.iloc[-1]), float(al_w.iloc[-1]), t, period_rsi),
         )
         st.dataframe(style_table(df_w), use_container_width=True, hide_index=True)
 
     with tab_s:
+        st.caption(f"타겟 목록: {fmt_list(tl_s)}  (기간 min **{tl_s[0]:.2f}** / max **{tl_s[-1]:.2f}**)")
         df_s = build_table(
-            target_rsi_list, current_price, cr_s,
+            tl_s, current_price, cr_s,
             lambda t: target_sma(
                 current_price, float(ag_s.iloc[-1]), float(al_s.iloc[-1]),
                 float(og_s.iloc[-1]), float(ol_s.iloc[-1]), t, period_rsi,
@@ -327,8 +333,9 @@ if run_btn or ticker_input:
         st.dataframe(style_table(df_s), use_container_width=True, hide_index=True)
 
     with tab_e:
+        st.caption(f"타겟 목록: {fmt_list(tl_e)}  (기간 min **{tl_e[0]:.2f}** / max **{tl_e[-1]:.2f}**)")
         df_e = build_table(
-            target_rsi_list, current_price, cr_e,
+            tl_e, current_price, cr_e,
             lambda t: target_ema(current_price, float(ag_e.iloc[-1]), float(al_e.iloc[-1]), t, period_rsi),
         )
         st.dataframe(style_table(df_e), use_container_width=True, hide_index=True)

@@ -224,7 +224,8 @@ with st.sidebar:
     interval = interval_options[interval_label]
 
     lookback_options = {
-        "3개월": "3mo", "6개월": "6mo", "1년": "1y", "2년": "2y", "5년": "5y",
+        "3개월": "3mo", "6개월": "6mo", "1년": "1y", "2년": "2y",
+        "5년": "5y", "10년": "10y", "15년": "15y",
     }
     lookback_label = st.selectbox(
         "조회 기간", list(lookback_options.keys()),
@@ -363,12 +364,50 @@ if run_btn or ticker_input:
         row=1, col=1,
     )
 
+    # 이동평균선
+    MA_PERIODS = [20, 60, 125, 200, 240, 365]
+    MA_COLORS  = ["#ef9a9a", "#ffb74d", "#fff176", "#a5d6a7", "#4fc3f7", "#ce93d8"]
+    for ma_p, ma_c in zip(MA_PERIODS, MA_COLORS):
+        ma = close.rolling(ma_p).mean()
+        if ma.dropna().empty:
+            continue
+        fig.add_trace(
+            go.Scatter(
+                x=ma.index, y=ma.values,
+                line=dict(color=ma_c, width=1),
+                name=f"MA{ma_p}",
+                opacity=0.7,
+            ),
+            row=1, col=1,
+        )
+
     # 현재가 수평선
     fig.add_hline(
         y=current_price, line_dash="solid", line_color="#ffeb3b", line_width=1.5,
         annotation_text=f"현재 {current_price:,.4g}", annotation_position="right",
         row=1, col=1,
     )
+
+    # Wilder 타겟 가격 수평선
+    for t_rsi in tl_w:
+        t_price = target_wilder(
+            current_price, float(ag_w.iloc[-1]), float(al_w.iloc[-1]), t_rsi, period_rsi
+        )
+        if t_price is None or t_price <= 0:
+            continue
+        is_fixed = t_rsi in FIXED_RSI
+        line_color = "#ef9a9a" if t_rsi >= 70 else ("#4fc3f7" if t_rsi <= 30 else "#bdbdbd")
+        pct = (t_price - current_price) / current_price * 100
+        fig.add_hline(
+            y=t_price,
+            line_dash="dot" if is_fixed else "dash",
+            line_color=line_color,
+            line_width=1,
+            annotation_text=f"RSI {t_rsi:.1f}  ({pct:+.1f}%)",
+            annotation_position="right",
+            annotation_font_size=10,
+            row=1, col=1,
+        )
 
     # RSI 세 라인
     rsi_traces = [

@@ -233,23 +233,15 @@ with st.sidebar:
     lookback = lookback_options[lookback_label]
 
     st.divider()
-    st.subheader("타겟 RSI 목록")
-    FIXED_RSI = [25, 30, 50, 70, 75]
-    st.caption(f"고정값: {', '.join(map(str, FIXED_RSI))}")
-    rsi_min = st.number_input(
-        "추가 최솟값 (선택)", min_value=1, max_value=24, value=20, step=1,
-    )
-    rsi_max = st.number_input(
-        "추가 최댓값 (선택)", min_value=76, max_value=99, value=80, step=1,
-    )
+    st.caption("타겟 RSI: 고정값 25·30·50·70·75 + 기간 내 RSI min/max 자동 추가")
 
     run_btn = st.button("계산하기", type="primary", use_container_width=True)
+
+FIXED_RSI = [25, 30, 50, 70, 75]
 
 # ── 메인 ──────────────────────────────────────────────────────────────────────
 
 if run_btn or ticker_input:
-    target_rsi_list = sorted({float(rsi_min), *[float(v) for v in FIXED_RSI], float(rsi_max)})
-
     with st.spinner(f"{ticker_input} 데이터 로딩 중..."):
         try:
             hist = yf.Ticker(ticker_input).history(period=lookback, interval=interval)
@@ -271,6 +263,12 @@ if run_btn or ticker_input:
     rsi_w, ag_w, al_w = calc_rsi_wilder(close, period_rsi)
     rsi_s, ag_s, al_s, og_s, ol_s = calc_rsi_sma(close, period_rsi)
     rsi_e, ag_e, al_e = calc_rsi_ema(close, period_rsi)
+
+    # 기간 내 RSI min/max (세 방식 통합, 1 단위 반올림)
+    import math
+    rsi_period_min = math.floor(min(rsi_w.min(), rsi_s.min(), rsi_e.min()))
+    rsi_period_max = math.ceil(max(rsi_w.max(), rsi_s.max(), rsi_e.max()))
+    target_rsi_list = sorted({float(rsi_period_min), *map(float, FIXED_RSI), float(rsi_period_max)})
 
     current_price = float(close.iloc[-1])
     last_date = close.index[-1]
@@ -303,6 +301,10 @@ if run_btn or ticker_input:
 
     # ── 타겟 가격 테이블 (탭) ─────────────────────────────────────────────
     st.subheader("타겟 RSI별 예상 가격")
+    st.caption(
+        f"타겟 목록: {', '.join(str(int(v)) if v == int(v) else str(v) for v in target_rsi_list)}"
+        f"  (고정: 25·30·50·70·75 + 기간 min **{rsi_period_min}** / max **{rsi_period_max}**)"
+    )
     tab_w, tab_s, tab_e = st.tabs(
         ["📊 Wilder (표준)", "📊 Cutler (SMA)", "📊 EMA RSI"]
     )

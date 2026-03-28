@@ -196,6 +196,30 @@ def style_table(df: pd.DataFrame):
     )
 
 
+# ── 구글시트 종목 로드 ─────────────────────────────────────────────────────────
+
+@st.cache_data(ttl=600, show_spinner=False)
+def load_sheet_tickers() -> pd.DataFrame:
+    """구글시트에서 티커·기업명 목록을 읽어 DataFrame 반환."""
+    try:
+        sheet_id   = st.secrets["GOOGLE_SHEET_ID"]
+        sheet_name = st.secrets["GOOGLE_SHEET_NAME"]
+    except KeyError:
+        return pd.DataFrame()
+    url = (
+        f"https://docs.google.com/spreadsheets/d/{sheet_id}"
+        f"/gviz/tq?tqx=out:csv&sheet={sheet_name}"
+    )
+    try:
+        df = pd.read_csv(url)
+    except Exception:
+        return pd.DataFrame()
+    needed = {"티커", "기업명"}
+    if not needed.issubset(df.columns):
+        return pd.DataFrame()
+    return df[["티커", "기업명"]].dropna(subset=["티커"]).reset_index(drop=True)
+
+
 # ── 사이드바 ──────────────────────────────────────────────────────────────────
 
 PRESET_TICKERS = {
@@ -216,8 +240,34 @@ with st.sidebar:
         if col.button(label, use_container_width=True):
             st.session_state["ticker_input"] = symbol
 
+    # 구글시트 종목 선택
+    st.divider()
+    st.caption("구글시트 종목 목록에서 선택")
+    refresh_col, _ = st.columns([1, 2])
+    if refresh_col.button("🔄 새로고침", use_container_width=True):
+        st.cache_data.clear()
+
+    sheet_df = load_sheet_tickers()
+    if sheet_df.empty:
+        st.caption("종목 목록을 불러오지 못했습니다.")
+    else:
+        options = ["— 선택 —"] + [
+            f"{row['기업명']}  ({row['티커']})" for _, row in sheet_df.iterrows()
+        ]
+        selected = st.selectbox(
+            "종목 선택",
+            options,
+            index=0,
+            label_visibility="collapsed",
+        )
+        if selected != "— 선택 —":
+            # 괄호 안 티커 추출
+            selected_ticker = selected.split("(")[-1].rstrip(")")
+            st.session_state["ticker_input"] = selected_ticker
+
+    st.divider()
     ticker_input = st.text_input(
-        "종목/지수 심볼",
+        "종목/지수 심볼 직접 입력",
         value=st.session_state.get("ticker_input", "^GSPC"),
         help="예) AAPL, TSLA, ^GSPC (S&P500), ^IXIC (나스닥), ^NDX (나스닥100), ^KS11 (KOSPI), 005930.KS (삼성전자)",
         key="ticker_input",

@@ -184,13 +184,27 @@ def style_table(df: pd.DataFrame):
 
 # ── 사이드바 ──────────────────────────────────────────────────────────────────
 
+PRESET_TICKERS = {
+    "S&P 500": "^GSPC",
+    "나스닥 종합": "^IXIC",
+    "나스닥 100": "^NDX",
+}
+
 with st.sidebar:
     st.header("설정")
 
+    # 주요 지수 빠른 선택
+    st.caption("주요 지수 빠른 선택")
+    preset_cols = st.columns(3)
+    for col, (label, symbol) in zip(preset_cols, PRESET_TICKERS.items()):
+        if col.button(label, use_container_width=True):
+            st.session_state["ticker_input"] = symbol
+
     ticker_input = st.text_input(
         "종목/지수 심볼",
-        value="^GSPC",
-        help="예) AAPL, TSLA, ^GSPC (S&P500), ^KS11 (KOSPI), 005930.KS (삼성전자)",
+        value=st.session_state.get("ticker_input", "^GSPC"),
+        help="예) AAPL, TSLA, ^GSPC (S&P500), ^IXIC (나스닥), ^NDX (나스닥100), ^KS11 (KOSPI), 005930.KS (삼성전자)",
+        key="ticker_input",
     )
 
     period_rsi = st.number_input(
@@ -201,20 +215,26 @@ with st.sidebar:
         "일봉": "1d", "주봉": "1wk", "월봉": "1mo",
         "1시간": "1h", "4시간": "4h", "15분": "15m",
     }
-    interval_label = st.selectbox("차트 간격", list(interval_options.keys()), index=0)
+    interval_label = st.selectbox(
+        "차트 간격", list(interval_options.keys()),
+        index=list(interval_options.keys()).index("주봉"),
+    )
     interval = interval_options[interval_label]
 
     lookback_options = {
         "3개월": "3mo", "6개월": "6mo", "1년": "1y", "2년": "2y", "5년": "5y",
     }
-    lookback_label = st.selectbox("조회 기간", list(lookback_options.keys()), index=1)
+    lookback_label = st.selectbox(
+        "조회 기간", list(lookback_options.keys()),
+        index=list(lookback_options.keys()).index("5년"),
+    )
     lookback = lookback_options[lookback_label]
 
     st.divider()
     st.subheader("타겟 RSI 목록")
     target_rsi_str = st.text_input(
         "쉼표로 구분 입력",
-        value="20, 25, 30, 35, 40, 45, 50, 55, 60, 65, 70, 75, 80",
+        value="23, 25, 27, 30, 35, 40, 45, 50, 55, 60, 65, 70, 75, 80",
     )
 
     run_btn = st.button("계산하기", type="primary", use_container_width=True)

@@ -234,9 +234,13 @@ with st.sidebar:
 
     st.divider()
     st.subheader("타겟 RSI 목록")
-    target_rsi_str = st.text_input(
-        "쉼표로 구분 입력",
-        value="23, 25, 27, 30, 35, 40, 45, 50, 55, 60, 65, 70, 75, 80",
+    FIXED_RSI = [25, 30, 50, 70, 75]
+    st.caption(f"고정값: {', '.join(map(str, FIXED_RSI))}")
+    rsi_min = st.number_input(
+        "추가 최솟값 (선택)", min_value=1, max_value=24, value=20, step=1,
+    )
+    rsi_max = st.number_input(
+        "추가 최댓값 (선택)", min_value=76, max_value=99, value=80, step=1,
     )
 
     run_btn = st.button("계산하기", type="primary", use_container_width=True)
@@ -244,13 +248,7 @@ with st.sidebar:
 # ── 메인 ──────────────────────────────────────────────────────────────────────
 
 if run_btn or ticker_input:
-    try:
-        target_rsi_list = sorted(
-            {float(x.strip()) for x in target_rsi_str.split(",") if x.strip()}
-        )
-    except ValueError:
-        st.error("타겟 RSI 목록에 숫자만 입력해주세요.")
-        st.stop()
+    target_rsi_list = sorted({float(rsi_min), *[float(v) for v in FIXED_RSI], float(rsi_max)})
 
     with st.spinner(f"{ticker_input} 데이터 로딩 중..."):
         try:

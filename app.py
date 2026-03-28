@@ -188,6 +188,8 @@ PRESET_TICKERS = {
     "S&P 500": "^GSPC",
     "나스닥 종합": "^IXIC",
     "나스닥 100": "^NDX",
+    "코스피": "^KS11",
+    "코스닥": "^KQ11",
 }
 
 with st.sidebar:
@@ -195,7 +197,7 @@ with st.sidebar:
 
     # 주요 지수 빠른 선택
     st.caption("주요 지수 빠른 선택")
-    preset_cols = st.columns(3)
+    preset_cols = st.columns(5)
     for col, (label, symbol) in zip(preset_cols, PRESET_TICKERS.items()):
         if col.button(label, use_container_width=True):
             st.session_state["ticker_input"] = symbol

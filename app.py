@@ -17,6 +17,20 @@ st.set_page_config(
     layout="wide",
 )
 
+st.markdown(
+    """
+    <style>
+    .stApp, [data-testid="stAppViewContainer"], [data-testid="stHeader"] {
+        background-color: #000000;
+    }
+    [data-testid="stSidebar"] {
+        background-color: #0a0a0a;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
 st.title("📈 RSI 타겟 가격 계산기")
 st.caption("종목/지수를 입력하면 현재 RSI와 타겟 RSI 달성에 필요한 가격 및 등락률을 계산합니다.")
 
@@ -366,7 +380,7 @@ if run_btn or ticker_input:
 
     # 이동평균선
     MA_PERIODS = [20, 60, 125, 200, 240, 365]
-    MA_COLORS  = ["#ef9a9a", "#ffb74d", "#fff176", "#a5d6a7", "#4fc3f7", "#ce93d8"]
+    MA_COLORS  = ["#ff0000", "#00cc00", "#3399ff", "#ffff00", "#ff8800", "#cccccc"]
     for ma_p, ma_c in zip(MA_PERIODS, MA_COLORS):
         ma = close.rolling(ma_p).mean()
         if ma.dropna().empty:
@@ -428,6 +442,8 @@ if run_btn or ticker_input:
 
     fig.update_layout(
         template="plotly_dark",
+        paper_bgcolor="#000000",
+        plot_bgcolor="#000000",
         height=750,
         xaxis_rangeslider_visible=False,
         legend=dict(orientation="h", y=1.02),
@@ -520,7 +536,10 @@ if run_btn or ticker_input:
                         name="pandas_ta", line=dict(color="#ffb74d", width=1.5, dash="dot"),
                     ))
                     fig_v.update_layout(
-                        template="plotly_dark", height=300,
+                        template="plotly_dark",
+                        paper_bgcolor="#000000",
+                        plot_bgcolor="#000000",
+                        height=300,
                         title=f"{label} RSI 비교",
                         margin=dict(l=10, r=10, t=40, b=10),
                         legend=dict(orientation="h"),

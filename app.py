@@ -5,6 +5,12 @@ import numpy as np
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
+try:
+    import pandas_ta as ta
+    PANDAS_TA_AVAILABLE = True
+except ImportError:
+    PANDAS_TA_AVAILABLE = False
+
 st.set_page_config(
     page_title="RSI 타겟 가격 계산기",
     page_icon="📈",
@@ -363,6 +369,95 @@ if run_btn or ticker_input:
     fig.update_yaxes(title_text="RSI", row=2, col=1, range=[0, 100])
 
     st.plotly_chart(fig, use_container_width=True)
+
+    # ── pandas_ta 검증 ────────────────────────────────────────────────────
+    with st.expander("🔬 pandas_ta 수치 비교 검증"):
+        if not PANDAS_TA_AVAILABLE:
+            st.warning("`pandas_ta` 가 설치되지 않았습니다. `pip install pandas_ta` 후 재실행하세요.")
+        else:
+            n_rows = st.slider("비교할 최근 봉 수", min_value=5, max_value=100, value=20)
+
+            # pandas_ta 계산
+            delta = close.diff()
+            gain_ser = delta.clip(lower=0)
+            loss_ser = -delta.clip(upper=0)
+
+            # Wilder: ta.rsi() 내부적으로 RMA(alpha=1/n) 사용
+            pta_rsi_w = ta.rsi(close, length=period_rsi)
+
+            # SMA: ta.sma() 으로 gain/loss 평균
+            pta_ag_s = ta.sma(gain_ser, length=period_rsi)
+            pta_al_s = ta.sma(loss_ser, length=period_rsi)
+            pta_rsi_s = 100 - 100 / (1 + pta_ag_s / pta_al_s)
+
+            # EMA: ta.ema() span=period (alpha=2/(period+1))
+            pta_ag_e = ta.ema(gain_ser, length=period_rsi)
+            pta_al_e = ta.ema(loss_ser, length=period_rsi)
+            pta_rsi_e = 100 - 100 / (1 + pta_ag_e / pta_al_e)
+
+            idx = close.index[-n_rows:]
+
+            def fmt_diff(diff_val):
+                """차이가 1e-6 이하면 ✅, 아니면 ⚠️"""
+                return f"✅ {diff_val:.2e}" if diff_val < 1e-6 else f"⚠️ {diff_val:.6f}"
+
+            methods = [
+                ("Wilder", rsi_w, pta_rsi_w),
+                ("Cutler (SMA)", rsi_s, pta_rsi_s),
+                ("EMA", rsi_e, pta_rsi_e),
+            ]
+
+            tab_vw, tab_vs, tab_ve = st.tabs(
+                ["📊 Wilder 검증", "📊 Cutler(SMA) 검증", "📊 EMA 검증"]
+            )
+
+            for tab, (label, our_rsi, pta_rsi) in zip(
+                [tab_vw, tab_vs, tab_ve], methods
+            ):
+                with tab:
+                    our = our_rsi.reindex(idx).rename("직접 구현")
+                    pta = pta_rsi.reindex(idx).rename("pandas_ta")
+                    diff = (our - pta).abs().rename("절대 오차")
+
+                    comp_df = pd.DataFrame({"직접 구현": our, "pandas_ta": pta, "절대 오차": diff})
+                    comp_df.index = comp_df.index.strftime("%Y-%m-%d %H:%M") if hasattr(comp_df.index, "strftime") else comp_df.index
+
+                    max_diff = diff.max()
+                    mean_diff = diff.mean()
+
+                    verdict = "✅ 일치 (오차 < 1e-6)" if max_diff < 1e-6 else f"⚠️ 최대 오차: {max_diff:.6f}"
+                    st.markdown(f"**{label}** — {verdict} &nbsp;|&nbsp; 평균 오차: `{mean_diff:.2e}`")
+
+                    def highlight_diff(col):
+                        if col.name != "절대 오차":
+                            return [""] * len(col)
+                        return [
+                            "color: #ef9a9a" if v >= 1e-6 else "color: #a5d6a7"
+                            for v in col
+                        ]
+
+                    st.dataframe(
+                        comp_df.style.apply(highlight_diff).format("{:.6f}"),
+                        use_container_width=True,
+                    )
+
+                    # 비교 차트
+                    fig_v = go.Figure()
+                    fig_v.add_trace(go.Scatter(
+                        x=our_rsi.index, y=our_rsi.values,
+                        name="직접 구현", line=dict(color="#4fc3f7", width=2),
+                    ))
+                    fig_v.add_trace(go.Scatter(
+                        x=pta_rsi.index, y=pta_rsi.values,
+                        name="pandas_ta", line=dict(color="#ffb74d", width=1.5, dash="dot"),
+                    ))
+                    fig_v.update_layout(
+                        template="plotly_dark", height=300,
+                        title=f"{label} RSI 비교",
+                        margin=dict(l=10, r=10, t=40, b=10),
+                        legend=dict(orientation="h"),
+                    )
+                    st.plotly_chart(fig_v, use_container_width=True)
 
     # ── 계산 방식 설명 ─────────────────────────────────────────────────────
     with st.expander("계산 방식 설명"):

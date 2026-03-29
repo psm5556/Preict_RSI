@@ -418,21 +418,28 @@ def _run_tabpfn_v1(values, timestamps, pred_len, item_id, token):
     predictor = TabPFNTimeSeriesPredictor(tabpfn_mode=TabPFNMode.CLIENT)
     pred = predictor.predict(train, test)
 
-    pred_df = pred.reset_index()
-    ts_cands = [c for c in pred_df.columns if "time" in str(c).lower() and c != "item_id"]
-    if ts_cands and "timestamp" not in pred_df.columns:
-        pred_df = pred_df.rename(columns={ts_cands[0]: "timestamp"})
-    pred_df["timestamp"] = pd.to_datetime(pred_df["timestamp"])
+    def _normalize_pred(df: pd.DataFrame) -> pd.DataFrame:
+        """timestamp 컬럼 정규화 + 분위수 컬럼을 float → string 으로 통일."""
+        ts_cands = [c for c in df.columns if "time" in str(c).lower() and c != "item_id"]
+        if ts_cands and "timestamp" not in df.columns:
+            df = df.rename(columns={ts_cands[0]: "timestamp"})
+        df["timestamp"] = pd.to_datetime(df["timestamp"])
+        # float 분위수 컬럼(0.1, 0.25 …) → string("0.1", "0.25" …)
+        rename_map = {c: str(c) for c in df.columns if isinstance(c, float)}
+        if rename_map:
+            df = df.rename(columns=rename_map)
+        # "mean" 컬럼이 있으면 "0.5" 또는 "target" 으로 alias
+        if "mean" in df.columns and "0.5" not in df.columns:
+            df = df.rename(columns={"mean": "0.5"})
+        return df
+
+    pred_df = _normalize_pred(pred.reset_index())
 
     hist_pred_df = None
     if train_bt is not None:
         try:
             bt_pred = predictor.predict(train_bt, test_bt)
-            hist_pred_df = bt_pred.reset_index()
-            ts_cands_bt = [c for c in hist_pred_df.columns if "time" in str(c).lower() and c != "item_id"]
-            if ts_cands_bt and "timestamp" not in hist_pred_df.columns:
-                hist_pred_df = hist_pred_df.rename(columns={ts_cands_bt[0]: "timestamp"})
-            hist_pred_df["timestamp"] = pd.to_datetime(hist_pred_df["timestamp"])
+            hist_pred_df = _normalize_pred(bt_pred.reset_index())
         except Exception:
             hist_pred_df = None
 

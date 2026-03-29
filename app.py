@@ -12,7 +12,7 @@ except ImportError:
     PANDAS_TA_AVAILABLE = False
 
 try:
-    from tabpfn_time_series import TabPFNTSPipeline, TabPFNMode
+    import tabpfn_client  # noqa: F401 (tabpfn-time-series 의존성)
     TABPFN_AVAILABLE = True
 except ImportError:
     TABPFN_AVAILABLE = False
@@ -275,45 +275,243 @@ def build_features(hist: pd.DataFrame, period_rsi: int = 14) -> pd.DataFrame:
     return f
 
 
-# ── TabPFN-TS 예측 ─────────────────────────────────────────────────────────────
+# ── TabPFN-TS 예측 (tabpfn-time-series) ───────────────────────────────────────
+
+def _patch_tabpfn_token_path():
+    """
+    tabpfn_client 토큰 저장 경로를 쓰기 가능한 위치로 자동 설정.
+    로컬 PC: ~/.tabpfn/config  /  Streamlit Cloud: /tmp/tabpfn_auth/config
+    """
+    import pathlib, os
+    candidates = [
+        pathlib.Path.home() / ".tabpfn",
+        pathlib.Path("/tmp") / "tabpfn_auth",
+        pathlib.Path(os.getcwd()) / ".tabpfn",
+    ]
+    chosen_dir = None
+    for d in candidates:
+        try:
+            d.mkdir(parents=True, exist_ok=True)
+            probe = d / "_write_probe"
+            probe.write_text("ok")
+            probe.unlink()
+            chosen_dir = d
+            break
+        except Exception:
+            continue
+    if chosen_dir is None:
+        return None
+    token_file = chosen_dir / "config"
+    try:
+        from tabpfn_client.service_wrapper import UserAuthenticationClient
+        import tabpfn_client.service_wrapper as sw
+        UserAuthenticationClient.CACHED_TOKEN_FILE = token_file
+        sw.CACHE_DIR = chosen_dir
+    except Exception:
+        pass
+    try:
+        import tabpfn_client.constants as const
+        const.CACHE_DIR = chosen_dir
+    except Exception:
+        pass
+    return token_file
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def _get_tabpfn_ts_version() -> tuple:
+    """tabpfn-time-series 설치 버전 반환 (major, minor, patch)"""
+    try:
+        import importlib.metadata
+        ver = importlib.metadata.version("tabpfn-time-series")
+        parts = [int(x) for x in ver.split(".")[:3]]
+        while len(parts) < 3:
+            parts.append(0)
+        return tuple(parts), ver
+    except Exception:
+        return (0, 0, 0), "unknown"
+
+
+def _clean_timeseries_for_tabpfn(values, timestamps):
+    """
+    TabPFN-TS 입력 전처리: 정렬, 중복 제거, NaN 보간, 일별 리샘플링.
+    Returns (values_list, timestamps_list)
+    """
+    dates = pd.to_datetime(list(timestamps))
+    vals  = pd.to_numeric(list(values), errors="coerce")
+    s = pd.Series(vals, index=dates, name="target").sort_index()
+    s = s[~s.index.duplicated(keep="last")]
+    s = s.interpolate(method="time").ffill().bfill()
+    s = s.resample("D").last().ffill()
+    s = s.dropna()
+    return s.tolist(), s.index.strftime("%Y-%m-%d").tolist()
+
+
+def _run_tabpfn_v1(values, timestamps, pred_len, item_id, token):
+    """tabpfn-time-series >= 1.0.0 API"""
+    import tabpfn_client
+    from tabpfn_time_series import (
+        TimeSeriesDataFrame,
+        FeatureTransformer,
+        TabPFNTimeSeriesPredictor,
+        TabPFNMode,
+    )
+    from tabpfn_time_series.data_preparation import generate_test_X
+    from tabpfn_time_series.features import RunningIndexFeature, CalendarFeature
+
+    if token:
+        _patch_tabpfn_token_path()
+        tabpfn_client.set_access_token(token)
+
+    clean_vals, clean_dates = _clean_timeseries_for_tabpfn(values, timestamps)
+    if len(clean_vals) < pred_len + 10:
+        raise ValueError(
+            f"전처리 후 데이터 부족 ({len(clean_vals)}행). 조회 기간을 늘려주세요."
+        )
+    clean_ts = pd.to_datetime(clean_dates)
+
+    df = pd.DataFrame(
+        {"target": clean_vals},
+        index=pd.MultiIndex.from_arrays(
+            [[item_id] * len(clean_ts), clean_ts],
+            names=["item_id", "timestamp"],
+        ),
+    )
+    full_tsdf = TimeSeriesDataFrame(df)
+    train = full_tsdf
+    test  = generate_test_X(train, pred_len)
+
+    # 과거 검증용 backtesting
+    train_bt, test_bt = None, None
+    try:
+        if len(clean_vals) > pred_len:
+            bt_vals  = clean_vals[:-pred_len]
+            bt_dates = clean_ts[:-pred_len]
+            df_bt = pd.DataFrame(
+                {"target": bt_vals},
+                index=pd.MultiIndex.from_arrays(
+                    [[item_id] * len(bt_dates), bt_dates],
+                    names=["item_id", "timestamp"],
+                ),
+            )
+            train_bt = TimeSeriesDataFrame(df_bt)
+            test_bt  = generate_test_X(train_bt, pred_len)
+    except Exception:
+        train_bt, test_bt = None, None
+
+    # 피처 공학
+    features = [RunningIndexFeature(), CalendarFeature()]
+    try:
+        from tabpfn_time_series.features import AutoSeasonalFeature
+        asf = AutoSeasonalFeature()
+        _, _ = FeatureTransformer([asf]).transform(train.copy(), test.copy())
+        features.append(AutoSeasonalFeature())
+    except Exception:
+        pass
+
+    train, test = FeatureTransformer(features).transform(train, test)
+    if train_bt is not None:
+        try:
+            train_bt, test_bt = FeatureTransformer(features).transform(train_bt, test_bt)
+        except Exception:
+            train_bt, test_bt = None, None
+
+    predictor = TabPFNTimeSeriesPredictor(tabpfn_mode=TabPFNMode.CLIENT)
+    pred = predictor.predict(train, test)
+
+    pred_df = pred.reset_index()
+    ts_cands = [c for c in pred_df.columns if "time" in str(c).lower() and c != "item_id"]
+    if ts_cands and "timestamp" not in pred_df.columns:
+        pred_df = pred_df.rename(columns={ts_cands[0]: "timestamp"})
+    pred_df["timestamp"] = pd.to_datetime(pred_df["timestamp"])
+
+    hist_pred_df = None
+    if train_bt is not None:
+        try:
+            bt_pred = predictor.predict(train_bt, test_bt)
+            hist_pred_df = bt_pred.reset_index()
+            ts_cands_bt = [c for c in hist_pred_df.columns if "time" in str(c).lower() and c != "item_id"]
+            if ts_cands_bt and "timestamp" not in hist_pred_df.columns:
+                hist_pred_df = hist_pred_df.rename(columns={ts_cands_bt[0]: "timestamp"})
+            hist_pred_df["timestamp"] = pd.to_datetime(hist_pred_df["timestamp"])
+        except Exception:
+            hist_pred_df = None
+
+    return pred_df, hist_pred_df
+
+
+def _run_tabpfn_v0(values, timestamps, pred_len, token):  # noqa: ARG001
+    """tabpfn-time-series 0.x (구버전) API"""
+    from tabpfn_time_series import TabPFNTimeSeriesPredictor
+    train_series = pd.Series(
+        values[:-pred_len] if len(values) > pred_len else values,
+        index=pd.DatetimeIndex(timestamps[:-pred_len] if len(timestamps) > pred_len else timestamps),
+    )
+    predictor = TabPFNTimeSeriesPredictor()
+    if hasattr(predictor, "fit_predict"):
+        preds = predictor.fit_predict(train_series, prediction_length=pred_len)
+    elif hasattr(predictor, "fit") and hasattr(predictor, "predict"):
+        predictor.fit(train_series)
+        preds = predictor.predict(prediction_length=pred_len)
+    else:
+        raise RuntimeError("v0.x에서 예측 메서드를 찾을 수 없습니다.")
+    if isinstance(preds, pd.Series):
+        pred_df = preds.reset_index()
+        pred_df.columns = ["timestamp", "target"]
+    elif isinstance(preds, pd.DataFrame):
+        pred_df = preds.reset_index() if preds.index.name else preds.copy()
+        if "timestamp" not in pred_df.columns:
+            pred_df = pred_df.rename(columns={pred_df.columns[0]: "timestamp"})
+        if "target" not in pred_df.columns and len(pred_df.columns) >= 2:
+            pred_df = pred_df.rename(columns={pred_df.columns[1]: "target"})
+    else:
+        raise RuntimeError(f"예상치 못한 예측 결과 타입: {type(preds)}")
+    pred_df["timestamp"] = pd.to_datetime(pred_df["timestamp"])
+    return pred_df
+
 
 def run_tabpfn_forecast(
     close: pd.Series,
-    features: pd.DataFrame,
-    horizon: int,
+    pred_len: int,
     token: str,
-) -> pd.DataFrame | None:
+) -> tuple:
     """
-    TabPFN-TS CLIENT 모드로 예측 실행.
-    반환: 분위수(0.1~0.9) + target 컬럼을 가진 DataFrame (index=timestamp)
+    TabPFN-TS 시계열 예측.
+    Returns (pred_df, hist_pred_df, error_msg)
+    pred_df      : 미래 예측 (timestamp, target [, 0.1~0.9 분위수])
+    hist_pred_df : 과거 검증 예측 (None 가능)
+    error_msg    : 오류 시 문자열, 성공 시 None
     """
-    import os
-    os.environ["TABPFN_API_TOKEN"] = token
+    (major, minor, _), ver_str = _get_tabpfn_ts_version()
+    if major == 0 and minor == 0:
+        return None, None, (
+            "❌ tabpfn-time-series 패키지를 찾을 수 없습니다.\n"
+            "requirements.txt: `tabpfn-time-series>=1.0.9`"
+        )
 
-    # 공통 인덱스 정렬 및 NaN 제거
-    common = close.index.intersection(features.index)
-    c = close.loc[common].copy()
-    f = features.loc[common].copy()
-    valid = f.notna().all(axis=1) & c.notna()
-    c, f = c[valid], f[valid]
+    close_clean = close.dropna()
+    ts_tz = close_clean.index
+    try:
+        timestamps = pd.DatetimeIndex(ts_tz).tz_localize(None)
+    except TypeError:
+        timestamps = pd.DatetimeIndex(ts_tz).tz_convert(None)
+    values = close_clean.values.tolist()
 
-    if len(c) < 30:
-        return None
+    if major >= 1:
+        try:
+            pred_df, hist_pred_df = _run_tabpfn_v1(
+                values, timestamps, pred_len, "price", token
+            )
+            return pred_df, hist_pred_df, None
+        except ImportError as e:
+            return None, None, f"❌ 모듈 임포트 실패 (tabpfn-time-series {ver_str}): {e}"
+        except Exception as e:
+            return None, None, f"❌ 예측 실패 (v{ver_str}): {e}"
 
-    # context_df 구성
-    timestamps = pd.to_datetime(c.index).tz_localize(None)  # tz-naive 필요
-    ctx = pd.DataFrame({"item_id": "price", "timestamp": timestamps, "target": c.values})
-    for col in f.columns:
-        ctx[col] = f[col].values
-
-    pipeline = TabPFNTSPipeline(tabpfn_mode=TabPFNMode.CLIENT)
-    pred = pipeline.predict_df(context_df=ctx, prediction_length=horizon)
-
-    # Multi-index (item_id, timestamp) → timestamp index
-    if isinstance(pred.index, pd.MultiIndex):
-        pred = pred.xs("price", level="item_id") if "price" in pred.index.get_level_values(0) else pred.droplevel(0)
-    pred.index = pd.to_datetime(pred.index)
-    return pred
+    try:
+        pred_df = _run_tabpfn_v0(values, timestamps, pred_len, token)
+        return pred_df, None, None
+    except Exception as e:
+        return None, None, f"❌ 예측 실패 (tabpfn-time-series {ver_str} 구버전): {e}"
 
 
 # ── 한국 티커 자동 처리 ────────────────────────────────────────────────────────
@@ -678,75 +876,75 @@ if run_btn or _ticker_val:
 
     st.plotly_chart(fig, use_container_width=True)
 
-    # ── TabPFN-TS 가격 예측 ───────────────────────────────────────────────
+    # ── TabPFN-TS 가격 예측 ──────────────────────────────────────────────
     with st.expander("🔮 TabPFN-TS 가격 예측 (AI)"):
-        if not TABPFN_AVAILABLE:
-            st.warning("`tabpfn-time-series` 미설치. `pip install tabpfn-time-series` 후 재실행하세요.")
+        (ts_major, ts_minor, _), ts_ver_str = _get_tabpfn_ts_version()
+        if ts_major == 0 and ts_minor == 0:
+            st.error(
+                "`tabpfn-time-series` 패키지가 설치되지 않았습니다.  \n"
+                "`requirements.txt`에 `tabpfn-time-series>=1.0.9` 를 추가하세요."
+            )
         else:
+            st.success(f"✅ tabpfn-time-series **{ts_ver_str}** 설치됨")
             try:
                 tabpfn_token = st.secrets["TABPFN_API_TOKEN"]
             except KeyError:
                 tabpfn_token = None
-                st.error("secrets에 `TABPFN_API_TOKEN` 이 없습니다.")
+                st.error("Streamlit Secrets에 `TABPFN_API_TOKEN` 이 없습니다.")
 
             if tabpfn_token:
-                col_h, col_btn = st.columns([3, 1])
-                horizon_opts = {
-                    f"4봉  (~{4}주)" if interval == "1wk" else f"4봉": 4,
-                    f"8봉  (~{8}주)" if interval == "1wk" else f"8봉": 8,
-                    f"12봉 (~3개월)" if interval == "1wk" else f"12봉": 12,
-                    f"26봉 (~6개월)" if interval == "1wk" else f"26봉": 26,
-                    f"52봉 (~1년)"   if interval == "1wk" else f"52봉": 52,
+                # 예측 기간을 봉 수 → 일 수로 변환 (TabPFN-TS 는 일별 리샘플 후 처리)
+                interval_days = {
+                    "1d": 1, "1wk": 7, "1mo": 30,
+                    "1h": 1, "4h": 1, "15m": 1,
                 }
-                horizon_label = col_h.selectbox("예측 기간", list(horizon_opts.keys()), index=2)
-                horizon = horizon_opts[horizon_label]
+                days_per_bar = interval_days.get(interval, 1)
+
+                col_h, col_btn = st.columns([3, 1])
+                horizon_opts_bars = {"4봉": 4, "8봉": 8, "12봉": 12, "26봉": 26, "52봉": 52}
+                horizon_label = col_h.selectbox("예측 기간 (봉 수)", list(horizon_opts_bars.keys()), index=2)
+                horizon_bars  = horizon_opts_bars[horizon_label]
+                pred_len_days = max(horizon_bars * days_per_bar, 4)
 
                 run_forecast = col_btn.button("예측 실행", type="primary", use_container_width=True)
 
-                # 피처 설명
-                with st.expander("사용 피처 목록", expanded=False):
-                    st.markdown("""
-| 카테고리 | 피처 |
-|---|---|
-| 모멘텀 | RSI(Wilder), Stochastic %K/%D |
-| 추세 | MA 비율(20·60·125·200), MACD/Signal/Hist |
-| 변동성 | Bollinger %B·Width, ATR 비율, 실현변동성(20봉) |
-| 수익률 | 로그 수익률(1·5·20봉) |
-| 거래량 | 거래량 / MA20 비율 |
-""")
-
                 if run_forecast:
-                    with st.spinner("피처 계산 및 TabPFN-TS 예측 중..."):
-                        feats = build_features(hist, period_rsi)
-                        pred_df = run_tabpfn_forecast(close, feats, horizon, tabpfn_token)
+                    with st.spinner(f"TabPFN-TS 예측 중 ({pred_len_days}일)..."):
+                        pred_df, hist_pred_df, err_msg = run_tabpfn_forecast(
+                            close, pred_len_days, tabpfn_token
+                        )
 
-                    if pred_df is None:
-                        st.error("유효 데이터 부족으로 예측 실패.")
+                    if err_msg:
+                        st.error(err_msg)
+                    elif pred_df is None:
+                        st.error("예측 결과가 없습니다.")
                     else:
                         # ── 예측 테이블
-                        q_cols = [c for c in pred_df.columns if str(c) in [str(q/10) for q in range(1,10)]]
-                        has_q  = len(q_cols) >= 3
+                        q_col_names = ["0.1", "0.25", "0.5", "0.75", "0.9"]
+                        has_q = all(c in pred_df.columns for c in ["0.1", "0.9"])
+                        med_col = "0.5" if "0.5" in pred_df.columns else "target"
 
                         tbl_rows = []
-                        for i, (ts, row) in enumerate(pred_df.iterrows()):
-                            tgt = row.get("target", row.get("0.5", np.nan))
-                            lo  = row.get(0.1, row.get("0.1", np.nan)) if has_q else np.nan
-                            hi  = row.get(0.9, row.get("0.9", np.nan)) if has_q else np.nan
-                            pct = (tgt - current_price) / current_price * 100 if not np.isnan(tgt) else np.nan
+                        for i, row in pred_df.iterrows():
+                            ts  = row["timestamp"] if "timestamp" in pred_df.columns else i
+                            tgt = row.get(med_col, np.nan)
+                            lo  = row.get("0.1", np.nan) if has_q else np.nan
+                            hi  = row.get("0.9", np.nan) if has_q else np.nan
+                            pct = (tgt - current_price) / current_price * 100 if not np.isnan(float(tgt)) else np.nan
                             tbl_rows.append({
-                                "봉": i + 1,
-                                "예상 날짜": ts.strftime("%Y-%m-%d") if hasattr(ts, "strftime") else str(ts),
-                                "예측가 (중앙값)": round(tgt, 4) if not np.isnan(tgt) else None,
-                                "하단 10%": round(lo, 4)  if not np.isnan(lo)  else None,
-                                "상단 90%": round(hi, 4)  if not np.isnan(hi)  else None,
-                                "등락률 (%)": round(pct, 2)  if not np.isnan(pct) else None,
+                                "#": i + 1,
+                                "날짜": ts.strftime("%Y-%m-%d") if hasattr(ts, "strftime") else str(ts),
+                                "예측가 (중앙값)": round(float(tgt), 4) if not np.isnan(float(tgt)) else None,
+                                "하단 10%": round(float(lo), 4) if not np.isnan(float(lo)) else None,
+                                "상단 90%": round(float(hi), 4) if not np.isnan(float(hi)) else None,
+                                "등락률 (%)": round(pct, 2) if not np.isnan(pct) else None,
                             })
 
                         st.dataframe(
                             pd.DataFrame(tbl_rows).style.format({
                                 "예측가 (중앙값)": lambda v: f"{v:,.4g}" if v else "-",
-                                "하단 10%":  lambda v: f"{v:,.4g}" if v else "-",
-                                "상단 90%":  lambda v: f"{v:,.4g}" if v else "-",
+                                "하단 10%": lambda v: f"{v:,.4g}" if v else "-",
+                                "상단 90%": lambda v: f"{v:,.4g}" if v else "-",
                                 "등락률 (%)": lambda v: f"{v:+.2f}%" if v else "-",
                             }, na_rep="-"),
                             use_container_width=True,
@@ -756,33 +954,37 @@ if run_btn or _ticker_val:
                         # ── 예측 차트 (fan chart)
                         fig_fc = go.Figure()
 
-                        # 최근 120봉 실제가
+                        # 최근 실제가 (일별 리샘플 된 데이터와 연결하기 위해 120봉)
                         hist_show = close.iloc[-120:]
                         fig_fc.add_trace(go.Scatter(
                             x=hist_show.index, y=hist_show.values,
                             name="실제 가격", line=dict(color="#ffffff", width=1.5),
                         ))
 
-                        pred_x = pred_df.index
+                        # 과거 검증 예측선
+                        if hist_pred_df is not None and "timestamp" in hist_pred_df.columns:
+                            hist_med = "0.5" if "0.5" in hist_pred_df.columns else "target"
+                            if hist_med in hist_pred_df.columns:
+                                fig_fc.add_trace(go.Scatter(
+                                    x=hist_pred_df["timestamp"], y=hist_pred_df[hist_med],
+                                    name="과거 검증 예측", line=dict(color="#ffa726", width=1.5, dash="dot"),
+                                ))
+
+                        pred_x = pred_df["timestamp"] if "timestamp" in pred_df.columns else pred_df.index
 
                         # 신뢰대역 (10%~90%)
                         if has_q:
-                            def _col(name):
-                                for k in [name, float(name)]:
-                                    if k in pred_df.columns:
-                                        return pred_df[k].values
-                                return None
+                            q10 = pred_df["0.1"].values
+                            q90 = pred_df["0.9"].values
+                            q25 = pred_df["0.25"].values if "0.25" in pred_df.columns else None
+                            q75 = pred_df["0.75"].values if "0.75" in pred_df.columns else None
 
-                            q10 = _col("0.1"); q90 = _col("0.9")
-                            q25 = _col("0.25"); q75 = _col("0.75")
-
-                            if q10 is not None and q90 is not None:
-                                fig_fc.add_trace(go.Scatter(
-                                    x=list(pred_x) + list(pred_x[::-1]),
-                                    y=list(q90) + list(q10[::-1]),
-                                    fill="toself", fillcolor="rgba(100,160,255,0.15)",
-                                    line=dict(color="rgba(0,0,0,0)"), name="10%~90%",
-                                ))
+                            fig_fc.add_trace(go.Scatter(
+                                x=list(pred_x) + list(pred_x[::-1]),
+                                y=list(q90) + list(q10[::-1]),
+                                fill="toself", fillcolor="rgba(100,160,255,0.15)",
+                                line=dict(color="rgba(0,0,0,0)"), name="10%~90%",
+                            ))
                             if q25 is not None and q75 is not None:
                                 fig_fc.add_trace(go.Scatter(
                                     x=list(pred_x) + list(pred_x[::-1]),
@@ -792,17 +994,15 @@ if run_btn or _ticker_val:
                                 ))
 
                         # 중앙값 예측선
-                        med_col = "target" if "target" in pred_df.columns else ("0.5" if "0.5" in pred_df.columns else None)
-                        if med_col:
-                            fig_fc.add_trace(go.Scatter(
-                                x=pred_x, y=pred_df[med_col].values,
-                                name="예측 중앙값", line=dict(color="#64a0ff", width=2, dash="dash"),
-                            ))
+                        fig_fc.add_trace(go.Scatter(
+                            x=pred_x, y=pred_df[med_col].values,
+                            name="예측 중앙값", line=dict(color="#64a0ff", width=2, dash="dash"),
+                        ))
 
-                        # 현재가 연결선
+                        # 현재가 수평 연결선
                         fig_fc.add_shape(
                             type="line",
-                            x0=close.index[-1], x1=pred_x[0] if len(pred_x) else close.index[-1],
+                            x0=close.index[-1], x1=pred_x.iloc[0] if hasattr(pred_x, "iloc") else pred_x[0],
                             y0=current_price, y1=current_price,
                             line=dict(color="#ffeb3b", width=1, dash="dot"),
                         )
@@ -810,7 +1010,7 @@ if run_btn or _ticker_val:
                         fig_fc.update_layout(
                             template="plotly_dark",
                             paper_bgcolor="#000000", plot_bgcolor="#000000",
-                            height=450, title="TabPFN-TS 가격 예측",
+                            height=450, title=f"TabPFN-TS 가격 예측 ({pred_len_days}일)",
                             margin=dict(l=10, r=10, t=40, b=10),
                             legend=dict(orientation="h"),
                         )

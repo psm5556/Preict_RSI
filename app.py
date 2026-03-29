@@ -11,6 +11,12 @@ try:
 except ImportError:
     PANDAS_TA_AVAILABLE = False
 
+try:
+    from tabpfn_time_series import TabPFNTSPipeline, TabPFNMode
+    TABPFN_AVAILABLE = True
+except ImportError:
+    TABPFN_AVAILABLE = False
+
 st.set_page_config(
     page_title="RSI 타겟 가격 계산기",
     page_icon="📈",
@@ -194,6 +200,120 @@ def style_table(df: pd.DataFrame):
          "등락률 (%)": lambda v: f"{v:+.2f}%" if v is not None else "-"},
         na_rep="-",
     )
+
+
+# ── 피처 엔지니어링 ───────────────────────────────────────────────────────────
+
+def build_features(hist: pd.DataFrame, period_rsi: int = 14) -> pd.DataFrame:
+    """기술 지표를 계산해 공변량 DataFrame 반환."""
+    close  = hist["Close"]
+    high   = hist["High"]
+    low    = hist["Low"]
+    volume = hist.get("Volume", pd.Series(np.nan, index=close.index))
+
+    f = pd.DataFrame(index=close.index)
+
+    # RSI (Wilder)
+    delta = close.diff()
+    gain  = delta.clip(lower=0)
+    loss  = -delta.clip(upper=0)
+    ag = gain.ewm(alpha=1 / period_rsi, adjust=False).mean()
+    al = loss.ewm(alpha=1 / period_rsi, adjust=False).mean()
+    f["rsi"] = 100 - 100 / (1 + ag / al)
+
+    # MA 비율 (price / MA - 1)
+    for p in [20, 60, 125, 200]:
+        ma = close.rolling(p).mean()
+        f[f"ma_ratio_{p}"] = (close / ma - 1).replace([np.inf, -np.inf], np.nan)
+
+    # MACD (normalized)
+    ema12  = close.ewm(span=12, adjust=False).mean()
+    ema26  = close.ewm(span=26, adjust=False).mean()
+    macd   = ema12 - ema26
+    signal = macd.ewm(span=9, adjust=False).mean()
+    f["macd"]       = (macd   / close).replace([np.inf, -np.inf], np.nan)
+    f["macd_sig"]   = (signal / close).replace([np.inf, -np.inf], np.nan)
+    f["macd_hist"]  = ((macd - signal) / close).replace([np.inf, -np.inf], np.nan)
+
+    # Bollinger Bands %B, Width
+    ma20  = close.rolling(20).mean()
+    std20 = close.rolling(20).std()
+    bb_u  = ma20 + 2 * std20
+    bb_l  = ma20 - 2 * std20
+    bb_rng = (bb_u - bb_l).replace(0, np.nan)
+    f["bb_pct"]   = (close - bb_l) / bb_rng
+    f["bb_width"] = bb_rng / ma20
+
+    # ATR 비율
+    tr = pd.concat([
+        high - low,
+        (high - close.shift()).abs(),
+        (low  - close.shift()).abs(),
+    ], axis=1).max(axis=1)
+    f["atr_ratio"] = (tr.ewm(alpha=1/14, adjust=False).mean() / close).replace([np.inf, -np.inf], np.nan)
+
+    # Stochastic %K / %D
+    lo14 = low.rolling(14).min()
+    hi14 = high.rolling(14).max()
+    rng14 = (hi14 - lo14).replace(0, np.nan)
+    stoch_k = (close - lo14) / rng14 * 100
+    f["stoch_k"] = stoch_k
+    f["stoch_d"] = stoch_k.rolling(3).mean()
+
+    # Log returns (1·5·20봉)
+    for lag in [1, 5, 20]:
+        f[f"log_ret_{lag}"] = np.log(close / close.shift(lag))
+
+    # Realized volatility (20봉)
+    f["vol_20"] = np.log(close / close.shift()).rolling(20).std()
+
+    # 거래량 비율
+    if volume.notna().any():
+        vol_ma = volume.rolling(20).mean().replace(0, np.nan)
+        f["vol_ratio"] = (volume / vol_ma).replace([np.inf, -np.inf], np.nan)
+
+    return f
+
+
+# ── TabPFN-TS 예측 ─────────────────────────────────────────────────────────────
+
+def run_tabpfn_forecast(
+    close: pd.Series,
+    features: pd.DataFrame,
+    horizon: int,
+    token: str,
+) -> pd.DataFrame | None:
+    """
+    TabPFN-TS CLIENT 모드로 예측 실행.
+    반환: 분위수(0.1~0.9) + target 컬럼을 가진 DataFrame (index=timestamp)
+    """
+    import os
+    os.environ["TABPFN_API_TOKEN"] = token
+
+    # 공통 인덱스 정렬 및 NaN 제거
+    common = close.index.intersection(features.index)
+    c = close.loc[common].copy()
+    f = features.loc[common].copy()
+    valid = f.notna().all(axis=1) & c.notna()
+    c, f = c[valid], f[valid]
+
+    if len(c) < 30:
+        return None
+
+    # context_df 구성
+    timestamps = pd.to_datetime(c.index).tz_localize(None)  # tz-naive 필요
+    ctx = pd.DataFrame({"item_id": "price", "timestamp": timestamps, "target": c.values})
+    for col in f.columns:
+        ctx[col] = f[col].values
+
+    pipeline = TabPFNTSPipeline(tabpfn_mode=TabPFNMode.CLIENT)
+    pred = pipeline.predict_df(context_df=ctx, prediction_length=horizon)
+
+    # Multi-index (item_id, timestamp) → timestamp index
+    if isinstance(pred.index, pd.MultiIndex):
+        pred = pred.xs("price", level="item_id") if "price" in pred.index.get_level_values(0) else pred.droplevel(0)
+    pred.index = pd.to_datetime(pred.index)
+    return pred
 
 
 # ── 한국 티커 자동 처리 ────────────────────────────────────────────────────────
@@ -557,6 +677,146 @@ if run_btn or _ticker_val:
     fig.update_yaxes(title_text="RSI", row=2, col=1, range=[0, 100])
 
     st.plotly_chart(fig, use_container_width=True)
+
+    # ── TabPFN-TS 가격 예측 ───────────────────────────────────────────────
+    with st.expander("🔮 TabPFN-TS 가격 예측 (AI)"):
+        if not TABPFN_AVAILABLE:
+            st.warning("`tabpfn-time-series` 미설치. `pip install tabpfn-time-series` 후 재실행하세요.")
+        else:
+            try:
+                tabpfn_token = st.secrets["TABPFN_API_TOKEN"]
+            except KeyError:
+                tabpfn_token = None
+                st.error("secrets에 `TABPFN_API_TOKEN` 이 없습니다.")
+
+            if tabpfn_token:
+                col_h, col_btn = st.columns([3, 1])
+                horizon_opts = {
+                    f"4봉  (~{4}주)" if interval == "1wk" else f"4봉": 4,
+                    f"8봉  (~{8}주)" if interval == "1wk" else f"8봉": 8,
+                    f"12봉 (~3개월)" if interval == "1wk" else f"12봉": 12,
+                    f"26봉 (~6개월)" if interval == "1wk" else f"26봉": 26,
+                    f"52봉 (~1년)"   if interval == "1wk" else f"52봉": 52,
+                }
+                horizon_label = col_h.selectbox("예측 기간", list(horizon_opts.keys()), index=2)
+                horizon = horizon_opts[horizon_label]
+
+                run_forecast = col_btn.button("예측 실행", type="primary", use_container_width=True)
+
+                # 피처 설명
+                with st.expander("사용 피처 목록", expanded=False):
+                    st.markdown("""
+| 카테고리 | 피처 |
+|---|---|
+| 모멘텀 | RSI(Wilder), Stochastic %K/%D |
+| 추세 | MA 비율(20·60·125·200), MACD/Signal/Hist |
+| 변동성 | Bollinger %B·Width, ATR 비율, 실현변동성(20봉) |
+| 수익률 | 로그 수익률(1·5·20봉) |
+| 거래량 | 거래량 / MA20 비율 |
+""")
+
+                if run_forecast:
+                    with st.spinner("피처 계산 및 TabPFN-TS 예측 중..."):
+                        feats = build_features(hist, period_rsi)
+                        pred_df = run_tabpfn_forecast(close, feats, horizon, tabpfn_token)
+
+                    if pred_df is None:
+                        st.error("유효 데이터 부족으로 예측 실패.")
+                    else:
+                        # ── 예측 테이블
+                        q_cols = [c for c in pred_df.columns if str(c) in [str(q/10) for q in range(1,10)]]
+                        has_q  = len(q_cols) >= 3
+
+                        tbl_rows = []
+                        for i, (ts, row) in enumerate(pred_df.iterrows()):
+                            tgt = row.get("target", row.get("0.5", np.nan))
+                            lo  = row.get(0.1, row.get("0.1", np.nan)) if has_q else np.nan
+                            hi  = row.get(0.9, row.get("0.9", np.nan)) if has_q else np.nan
+                            pct = (tgt - current_price) / current_price * 100 if not np.isnan(tgt) else np.nan
+                            tbl_rows.append({
+                                "봉": i + 1,
+                                "예상 날짜": ts.strftime("%Y-%m-%d") if hasattr(ts, "strftime") else str(ts),
+                                "예측가 (중앙값)": round(tgt, 4) if not np.isnan(tgt) else None,
+                                "하단 10%": round(lo, 4)  if not np.isnan(lo)  else None,
+                                "상단 90%": round(hi, 4)  if not np.isnan(hi)  else None,
+                                "등락률 (%)": round(pct, 2)  if not np.isnan(pct) else None,
+                            })
+
+                        st.dataframe(
+                            pd.DataFrame(tbl_rows).style.format({
+                                "예측가 (중앙값)": lambda v: f"{v:,.4g}" if v else "-",
+                                "하단 10%":  lambda v: f"{v:,.4g}" if v else "-",
+                                "상단 90%":  lambda v: f"{v:,.4g}" if v else "-",
+                                "등락률 (%)": lambda v: f"{v:+.2f}%" if v else "-",
+                            }, na_rep="-"),
+                            use_container_width=True,
+                            hide_index=True,
+                        )
+
+                        # ── 예측 차트 (fan chart)
+                        fig_fc = go.Figure()
+
+                        # 최근 120봉 실제가
+                        hist_show = close.iloc[-120:]
+                        fig_fc.add_trace(go.Scatter(
+                            x=hist_show.index, y=hist_show.values,
+                            name="실제 가격", line=dict(color="#ffffff", width=1.5),
+                        ))
+
+                        pred_x = pred_df.index
+
+                        # 신뢰대역 (10%~90%)
+                        if has_q:
+                            def _col(name):
+                                for k in [name, float(name)]:
+                                    if k in pred_df.columns:
+                                        return pred_df[k].values
+                                return None
+
+                            q10 = _col("0.1"); q90 = _col("0.9")
+                            q25 = _col("0.25"); q75 = _col("0.75")
+
+                            if q10 is not None and q90 is not None:
+                                fig_fc.add_trace(go.Scatter(
+                                    x=list(pred_x) + list(pred_x[::-1]),
+                                    y=list(q90) + list(q10[::-1]),
+                                    fill="toself", fillcolor="rgba(100,160,255,0.15)",
+                                    line=dict(color="rgba(0,0,0,0)"), name="10%~90%",
+                                ))
+                            if q25 is not None and q75 is not None:
+                                fig_fc.add_trace(go.Scatter(
+                                    x=list(pred_x) + list(pred_x[::-1]),
+                                    y=list(q75) + list(q25[::-1]),
+                                    fill="toself", fillcolor="rgba(100,160,255,0.30)",
+                                    line=dict(color="rgba(0,0,0,0)"), name="25%~75%",
+                                ))
+
+                        # 중앙값 예측선
+                        med_col = "target" if "target" in pred_df.columns else ("0.5" if "0.5" in pred_df.columns else None)
+                        if med_col:
+                            fig_fc.add_trace(go.Scatter(
+                                x=pred_x, y=pred_df[med_col].values,
+                                name="예측 중앙값", line=dict(color="#64a0ff", width=2, dash="dash"),
+                            ))
+
+                        # 현재가 연결선
+                        fig_fc.add_shape(
+                            type="line",
+                            x0=close.index[-1], x1=pred_x[0] if len(pred_x) else close.index[-1],
+                            y0=current_price, y1=current_price,
+                            line=dict(color="#ffeb3b", width=1, dash="dot"),
+                        )
+
+                        fig_fc.update_layout(
+                            template="plotly_dark",
+                            paper_bgcolor="#000000", plot_bgcolor="#000000",
+                            height=450, title="TabPFN-TS 가격 예측",
+                            margin=dict(l=10, r=10, t=40, b=10),
+                            legend=dict(orientation="h"),
+                        )
+                        st.plotly_chart(fig_fc, use_container_width=True)
+
+                        st.caption("⚠️ 예측 결과는 참고용이며 투자 판단의 근거로 사용할 수 없습니다.")
 
     # ── pandas_ta 검증 ────────────────────────────────────────────────────
     with st.expander("🔬 pandas_ta 수치 비교 검증"):

@@ -262,6 +262,12 @@ PRESET_TICKERS = {
     "코스닥": "^KQ11",
 }
 
+# 세션 상태 초기화
+if "_ticker" not in st.session_state:
+    st.session_state["_ticker"] = "^GSPC"
+if "_sheet_sel" not in st.session_state:
+    st.session_state["_sheet_sel"] = "— 선택 —"
+
 with st.sidebar:
     st.header("설정")
 
@@ -270,7 +276,8 @@ with st.sidebar:
     preset_cols = st.columns(5)
     for col, (label, symbol) in zip(preset_cols, PRESET_TICKERS.items()):
         if col.button(label, use_container_width=True):
-            st.session_state["ticker_input"] = symbol
+            st.session_state["_ticker"] = symbol
+            st.session_state["_sheet_sel"] = "— 선택 —"  # selectbox 초기화
 
     # 구글시트 종목 선택
     st.divider()
@@ -287,24 +294,32 @@ with st.sidebar:
         options = ["— 선택 —"] + [
             f"{row['기업명']}  ({row['티커']})" for _, row in sheet_df.iterrows()
         ]
+        # 현재 selectbox 위치 계산 (초기화 후에는 0)
+        cur_sel = st.session_state["_sheet_sel"]
+        sel_idx = options.index(cur_sel) if cur_sel in options else 0
+
         selected = st.selectbox(
             "종목 선택",
             options,
-            index=0,
+            index=sel_idx,
             label_visibility="collapsed",
         )
-        if selected != "— 선택 —":
-            # 괄호 안 티커 추출
-            selected_ticker = selected.split("(")[-1].rstrip(")")
-            st.session_state["ticker_input"] = selected_ticker
+        # 이전 값과 달라졌을 때만 티커 업데이트
+        if selected != st.session_state["_sheet_sel"]:
+            st.session_state["_sheet_sel"] = selected
+            if selected != "— 선택 —":
+                st.session_state["_ticker"] = selected.split("(")[-1].rstrip(")")
 
     st.divider()
     ticker_input = st.text_input(
         "종목/지수 심볼 직접 입력",
-        value=st.session_state.get("ticker_input", "^GSPC"),
+        value=st.session_state["_ticker"],
         help="예) AAPL, TSLA, ^GSPC (S&P500), ^IXIC (나스닥), ^NDX (나스닥100), ^KS11 (KOSPI), 005930.KS (삼성전자)",
-        key="ticker_input",
     )
+    # 직접 입력 시 상태 동기화
+    if ticker_input != st.session_state["_ticker"]:
+        st.session_state["_ticker"] = ticker_input
+        st.session_state["_sheet_sel"] = "— 선택 —"
 
     period_rsi = st.number_input(
         "RSI 기간 (봉 수)", min_value=2, max_value=50, value=14, step=1,
@@ -339,10 +354,12 @@ FIXED_RSI = [25, 30, 50, 70, 75]
 
 # ── 메인 ──────────────────────────────────────────────────────────────────────
 
-if run_btn or ticker_input:
-    resolved = resolve_ticker(ticker_input.strip())
-    if resolved != ticker_input.strip():
-        st.sidebar.caption(f"티커 변환: `{ticker_input.strip()}` → `{resolved}`")
+_ticker_val = st.session_state["_ticker"].strip()
+
+if run_btn or _ticker_val:
+    resolved = resolve_ticker(_ticker_val)
+    if resolved != _ticker_val:
+        st.sidebar.caption(f"티커 변환: `{_ticker_val}` → `{resolved}`")
 
     with st.spinner(f"{resolved} 데이터 로딩 중..."):
         try:
@@ -352,7 +369,7 @@ if run_btn or ticker_input:
             st.stop()
 
     if hist.empty:
-        st.error(f"'{ticker_input}' 데이터를 가져오지 못했습니다. 심볼을 확인해주세요.")
+        st.error(f"'{_ticker_val}' 데이터를 가져오지 못했습니다. 심볼을 확인해주세요.")
         st.stop()
 
     close = hist["Close"].dropna()

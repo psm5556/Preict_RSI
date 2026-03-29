@@ -196,6 +196,32 @@ def style_table(df: pd.DataFrame):
     )
 
 
+# ── 한국 티커 자동 처리 ────────────────────────────────────────────────────────
+
+import re
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def resolve_ticker(ticker: str) -> str:
+    """
+    6자리 한국 주식 티커(숫자/영문 혼합, 예: 005930, 0046A0)에
+    yfinance 접미사(.KS 또는 .KQ)를 자동으로 붙여 반환.
+    - 이미 접미사가 있거나(. 포함) 지수(^ 시작)면 그대로 반환.
+    - .KS 조회 성공 → .KS, .KQ 조회 성공 → .KQ, 둘 다 실패 → 원본 반환.
+    """
+    if "." in ticker or ticker.startswith("^"):
+        return ticker
+    if not re.match(r'^\d[0-9A-Za-z]{5}$', ticker):
+        return ticker
+    for suffix in [".KS", ".KQ"]:
+        try:
+            h = yf.Ticker(ticker + suffix).history(period="5d")
+            if not h.empty:
+                return ticker + suffix
+        except Exception:
+            continue
+    return ticker
+
+
 # ── 구글시트 종목 로드 ─────────────────────────────────────────────────────────
 
 @st.cache_data(ttl=600, show_spinner=False)
@@ -314,9 +340,13 @@ FIXED_RSI = [25, 30, 50, 70, 75]
 # ── 메인 ──────────────────────────────────────────────────────────────────────
 
 if run_btn or ticker_input:
-    with st.spinner(f"{ticker_input} 데이터 로딩 중..."):
+    resolved = resolve_ticker(ticker_input.strip())
+    if resolved != ticker_input.strip():
+        st.sidebar.caption(f"티커 변환: `{ticker_input.strip()}` → `{resolved}`")
+
+    with st.spinner(f"{resolved} 데이터 로딩 중..."):
         try:
-            hist = yf.Ticker(ticker_input).history(period=lookback, interval=interval)
+            hist = yf.Ticker(resolved).history(period=lookback, interval=interval)
         except Exception as e:
             st.error(f"데이터 로딩 실패: {e}")
             st.stop()
@@ -351,7 +381,7 @@ if run_btn or ticker_input:
     cr_e = float(rsi_e.iloc[-1])
 
     # ── 헤더 ────────────────────────────────────────────────────────────────
-    st.subheader(f"{ticker_input.upper()}  |  {interval_label}  |  {date_str}")
+    st.subheader(f"{resolved.upper()}  |  {interval_label}  |  {date_str}")
 
     c0, c1, c2, c3 = st.columns(4)
     with c0:

@@ -689,6 +689,410 @@ def run_lgbm_forecast(
     return pred_df, hist_pred_df, None
 
 
+# ── Trend Vision / Multi Lens 지표 헬퍼 ──────────────────────────────────────
+
+def _supertrend(high: pd.Series, low: pd.Series, close: pd.Series,
+                period: int = 14, multiplier: float = 3.0):
+    """ATR 기반 Supertrend 계산. Returns (supertrend_series, is_up_series)."""
+    n = len(close)
+    h = high.values.astype(float)
+    l = low.values.astype(float)
+    c = close.values.astype(float)
+
+    # True Range
+    prev_c = np.roll(c, 1)
+    prev_c[0] = c[0]
+    tr = np.maximum(h - l, np.maximum(np.abs(h - prev_c), np.abs(l - prev_c)))
+
+    # Wilder ATR
+    alpha = 1.0 / period
+    atr = np.zeros(n)
+    atr[0] = tr[0]
+    for i in range(1, n):
+        atr[i] = alpha * tr[i] + (1 - alpha) * atr[i - 1]
+
+    hl2 = (h + l) / 2
+    raw_upper = hl2 + multiplier * atr
+    raw_lower = hl2 - multiplier * atr
+
+    upper = raw_upper.copy()
+    lower = raw_lower.copy()
+    supertrend = np.zeros(n)
+    is_up_arr = np.ones(n, dtype=bool)
+
+    supertrend[0] = lower[0]
+    for i in range(1, n):
+        # Adjust lower band (only moves up)
+        lower[i] = raw_lower[i] if (raw_lower[i] > lower[i - 1] or c[i - 1] < lower[i - 1]) else lower[i - 1]
+        # Adjust upper band (only moves down)
+        upper[i] = raw_upper[i] if (raw_upper[i] < upper[i - 1] or c[i - 1] > upper[i - 1]) else upper[i - 1]
+
+        if is_up_arr[i - 1]:
+            is_up_arr[i] = c[i] >= lower[i]
+        else:
+            is_up_arr[i] = c[i] > upper[i]
+
+        supertrend[i] = lower[i] if is_up_arr[i] else upper[i]
+
+    return (
+        pd.Series(supertrend, index=close.index),
+        pd.Series(is_up_arr, index=close.index),
+    )
+
+
+def _add_bg_bands(fig, dates, is_up: pd.Series, row: int = 1, col: int = 1):
+    """연속 상승/하락 구간을 초록/빨간 배경 vrect으로 추가."""
+    date_list = list(dates)
+    n = len(date_list)
+    if n == 0:
+        return
+    i = 0
+    while i < n:
+        color = "rgba(0,160,0,0.13)" if bool(is_up.iloc[i]) else "rgba(200,0,0,0.13)"
+        j = i + 1
+        while j < n and bool(is_up.iloc[j]) == bool(is_up.iloc[i]):
+            j += 1
+        fig.add_vrect(
+            x0=date_list[i], x1=date_list[j - 1],
+            fillcolor=color, opacity=1.0, layer="below", line_width=0,
+            row=row, col=col,
+        )
+        i = j
+
+
+def render_trend_vision(ticker: str, hist: pd.DataFrame):
+    """주봉 Trend Vision: Supertrend 배경 + MACD 기반 UP/DOWN/BOTTOM 신호 + 요약."""
+    close = hist["Close"]
+    high  = hist["High"]
+    low   = hist["Low"]
+    dates = close.index
+
+    # Supertrend (주봉 기본: period=20, multiplier=2.5)
+    st_line, is_up = _supertrend(high, low, close, period=20, multiplier=2.5)
+
+    # MACD
+    ema12     = close.ewm(span=12, adjust=False).mean()
+    ema26     = close.ewm(span=26, adjust=False).mean()
+    macd_line = ema12 - ema26
+    sig_line  = macd_line.ewm(span=9, adjust=False).mean()
+    hist_macd = macd_line - sig_line
+
+    # RSI (Wilder 14)
+    delta = close.diff()
+    ag = delta.clip(lower=0).ewm(alpha=1 / 14, adjust=False).mean()
+    al = (-delta.clip(upper=0)).ewm(alpha=1 / 14, adjust=False).mean()
+    rsi = 100 - 100 / (1 + ag / al.replace(0, np.nan))
+
+    # MA
+    ma20 = close.rolling(20).mean()
+    ma60 = close.rolling(60).mean()
+
+    # 신호 감지 (너무 촘촘하지 않게 최소 간격 적용)
+    up_raw     = (hist_macd > 0) & (hist_macd.shift(1) <= 0) & is_up
+    down_raw   = (hist_macd < 0) & (hist_macd.shift(1) >= 0) & (~is_up)
+    bottom_raw = (~is_up.shift(1).fillna(True)) & is_up & (rsi < 40)
+
+    def _filter_min_gap(mask: pd.Series, gap: int = 4) -> pd.Series:
+        result = mask.copy()
+        last = -gap
+        for i, (idx, v) in enumerate(mask.items()):
+            if v:
+                if i - last < gap:
+                    result[idx] = False
+                else:
+                    last = i
+        return result
+
+    up_sig     = _filter_min_gap(up_raw, gap=4)
+    down_sig   = _filter_min_gap(down_raw, gap=4)
+    bottom_sig = _filter_min_gap(bottom_raw, gap=4)
+
+    # ── 차트 (캔들 + MACD 하단)
+    fig = make_subplots(
+        rows=2, cols=1,
+        shared_xaxes=True,
+        row_heights=[0.72, 0.28],
+        vertical_spacing=0.03,
+    )
+
+    _add_bg_bands(fig, dates, is_up, row=1, col=1)
+
+    fig.add_trace(go.Candlestick(
+        x=dates, open=hist["Open"], high=high, low=low, close=close,
+        name="Price",
+        increasing_line_color="#26a69a", decreasing_line_color="#ef5350",
+        showlegend=False,
+    ), row=1, col=1)
+
+    fig.add_trace(go.Scatter(x=dates, y=ma20, name="MA20",
+                             line=dict(color="#f59e0b", width=1.2)), row=1, col=1)
+    fig.add_trace(go.Scatter(x=dates, y=ma60, name="MA60",
+                             line=dict(color="#60a5fa", width=1.2)), row=1, col=1)
+    fig.add_trace(go.Scatter(x=dates, y=st_line, name="Supertrend",
+                             line=dict(color="rgba(255,255,255,0.35)", width=1, dash="dot"),
+                             showlegend=False), row=1, col=1)
+
+    # 신호 어노테이션
+    for idx in dates[up_sig]:
+        fig.add_annotation(x=idx, y=float(low[idx]) * 0.993,
+                           text="▲ UP", showarrow=False,
+                           font=dict(color="#00e676", size=10, family="Arial Black"),
+                           row=1, col=1)
+    for idx in dates[down_sig]:
+        fig.add_annotation(x=idx, y=float(high[idx]) * 1.007,
+                           text="▼ DOWN", showarrow=False,
+                           font=dict(color="#ff5252", size=10, family="Arial Black"),
+                           row=1, col=1)
+    for idx in dates[bottom_sig]:
+        fig.add_annotation(x=idx, y=float(low[idx]) * 0.986,
+                           text="◆ BOTTOM", showarrow=False,
+                           font=dict(color="#ffd700", size=11, family="Arial Black"),
+                           row=1, col=1)
+
+    # MACD 패널
+    bar_colors = ["#26a69a" if v >= 0 else "#ef5350" for v in hist_macd.fillna(0)]
+    fig.add_trace(go.Bar(x=dates, y=hist_macd, marker_color=bar_colors,
+                         name="MACD Hist", showlegend=False), row=2, col=1)
+    fig.add_trace(go.Scatter(x=dates, y=macd_line, name="MACD",
+                             line=dict(color="#60a5fa", width=1), showlegend=False), row=2, col=1)
+    fig.add_trace(go.Scatter(x=dates, y=sig_line, name="Signal",
+                             line=dict(color="#f59e0b", width=1), showlegend=False), row=2, col=1)
+
+    fig.update_layout(
+        title=dict(text=f"{ticker} — Trend Vision (주봉)", font=dict(size=15)),
+        paper_bgcolor="#0a0a0a", plot_bgcolor="#0d1117",
+        font_color="white", height=560,
+        xaxis_rangeslider_visible=False,
+        legend=dict(orientation="h", y=1.02, x=0, font=dict(size=11)),
+        margin=dict(t=55, b=10, l=10, r=10),
+    )
+    fig.update_xaxes(showgrid=False)
+    fig.update_yaxes(showgrid=True, gridcolor="#1e1e2e")
+
+    # Streamlit 열: 차트(좌) + 요약(우)
+    chart_col, sum_col = st.columns([5, 1])
+    with chart_col:
+        st.plotly_chart(fig, use_container_width=True)
+    with sum_col:
+        st.markdown("#### 현재 상태")
+        trend_txt = "📈 상승" if bool(is_up.iloc[-1]) else "📉 하락"
+        st.metric("추세", trend_txt)
+        st.metric("RSI(14)", f"{rsi.iloc[-1]:.1f}")
+        macd_val = macd_line.iloc[-1]
+        st.metric("MACD", f"{macd_val:.3g}", delta=f"{hist_macd.iloc[-1]:.3g}")
+        if not np.isnan(ma20.iloc[-1]):
+            st.metric("vs MA20", f"{(close.iloc[-1]/ma20.iloc[-1]-1)*100:+.2f}%")
+        if not np.isnan(ma60.iloc[-1]):
+            st.metric("vs MA60", f"{(close.iloc[-1]/ma60.iloc[-1]-1)*100:+.2f}%")
+
+
+def render_multi_lens(ticker: str, hist: pd.DataFrame):
+    """일봉 Multi Lens: Supertrend 배경 + 다중신호 스코어 + 6개 지표 패널."""
+    close  = hist["Close"]
+    high   = hist["High"]
+    low    = hist["Low"]
+    volume = hist.get("Volume", pd.Series(np.nan, index=close.index))
+    dates  = close.index
+
+    # Supertrend (일봉: period=14, multiplier=3.0)
+    st_line, is_up = _supertrend(high, low, close, period=14, multiplier=3.0)
+
+    # RSI
+    delta = close.diff()
+    ag = delta.clip(lower=0).ewm(alpha=1 / 14, adjust=False).mean()
+    al = (-delta.clip(upper=0)).ewm(alpha=1 / 14, adjust=False).mean()
+    rsi = 100 - 100 / (1 + ag / al.replace(0, np.nan))
+
+    # MACD
+    ema12     = close.ewm(span=12, adjust=False).mean()
+    ema26     = close.ewm(span=26, adjust=False).mean()
+    macd_line = ema12 - ema26
+    sig_line  = macd_line.ewm(span=9, adjust=False).mean()
+    hist_macd = macd_line - sig_line
+
+    # Bollinger Bands
+    ma20  = close.rolling(20).mean()
+    std20 = close.rolling(20).std()
+    bb_u  = ma20 + 2 * std20
+    bb_l  = ma20 - 2 * std20
+    bb_pct = ((close - bb_l) / (bb_u - bb_l).replace(0, np.nan)).clip(-0.5, 1.5)
+
+    # Stochastic
+    lo14    = low.rolling(14).min()
+    hi14    = high.rolling(14).max()
+    stoch_k = ((close - lo14) / (hi14 - lo14).replace(0, np.nan) * 100).clip(0, 100)
+    stoch_d = stoch_k.rolling(3).mean()
+
+    # CCI
+    tp    = (high + low + close) / 3
+    ma_tp = tp.rolling(20).mean()
+    md_tp = tp.rolling(20).apply(lambda x: np.mean(np.abs(x - x.mean())), raw=True)
+    cci   = (tp - ma_tp) / (0.015 * md_tp.replace(0, np.nan))
+
+    # ADX / ±DI
+    h_diff   = high.diff()
+    l_diff   = -low.diff()
+    plus_dm  = pd.Series(np.where((h_diff > l_diff) & (h_diff > 0), h_diff, 0.0), index=close.index)
+    minus_dm = pd.Series(np.where((l_diff > h_diff) & (l_diff > 0), l_diff, 0.0), index=close.index)
+    prev_c   = close.shift(1)
+    tr_raw   = pd.concat([high - low, (high - prev_c).abs(), (low - prev_c).abs()], axis=1).max(axis=1)
+    atr14    = tr_raw.ewm(alpha=1 / 14, adjust=False).mean()
+    plus_di  = 100 * plus_dm.ewm(alpha=1 / 14, adjust=False).mean() / atr14
+    minus_di = 100 * minus_dm.ewm(alpha=1 / 14, adjust=False).mean() / atr14
+    dx       = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan)
+    adx      = dx.ewm(alpha=1 / 14, adjust=False).mean()
+
+    # MA60, Volume ratio
+    ma60     = close.rolling(60).mean()
+    vol_ma20 = volume.rolling(20).mean().replace(0, np.nan)
+    vol_ratio = (volume / vol_ma20).replace([np.inf, -np.inf], np.nan)
+
+    # 다중신호 스코어 (-7 ~ +7)
+    score = (
+        np.sign(rsi - 50).fillna(0)
+        + np.sign(hist_macd).fillna(0)
+        + np.sign(stoch_k - 50).fillna(0)
+        + np.sign(close / ma20.replace(0, np.nan) - 1).fillna(0)
+        + np.sign(close / ma60.replace(0, np.nan) - 1).fillna(0)
+        + np.sign(bb_pct - 0.5).fillna(0)
+        + np.sign(vol_ratio - 1).fillna(0)
+    )
+
+    # 신호: Supertrend 전환 또는 스코어 임계 돌파
+    up_flip    = is_up & (~is_up.shift(1).fillna(True))
+    dn_flip    = (~is_up) & (is_up.shift(1).fillna(False))
+    score_up   = (score >= 4) & (score.shift(1).fillna(0) < 4)
+    score_dn   = (score <= -4) & (score.shift(1).fillna(0) > -4)
+    up_signals = (up_flip | score_up)
+    dn_signals = (dn_flip | score_dn)
+
+    def _filter_min_gap(mask: pd.Series, gap: int = 5) -> pd.Series:
+        result = mask.copy()
+        last = -gap
+        for i, (idx, v) in enumerate(mask.items()):
+            if v:
+                if i - last < gap:
+                    result[idx] = False
+                else:
+                    last = i
+        return result
+
+    up_signals = _filter_min_gap(up_signals, gap=5)
+    dn_signals = _filter_min_gap(dn_signals, gap=5)
+
+    # ── 서브플롯 (캔들 + RSI + MACD + BB%B + Stoch + CCI + ADX)
+    fig = make_subplots(
+        rows=7, cols=1,
+        shared_xaxes=True,
+        row_heights=[0.36, 0.10, 0.10, 0.10, 0.10, 0.12, 0.12],
+        subplot_titles=["", "RSI(14)", "MACD", "Bollinger %B", "Stochastic(14)", "CCI(20)", "ADX(14)"],
+        vertical_spacing=0.025,
+    )
+
+    _add_bg_bands(fig, dates, is_up, row=1, col=1)
+
+    # 캔들
+    fig.add_trace(go.Candlestick(
+        x=dates, open=hist["Open"], high=high, low=low, close=close,
+        name="Price",
+        increasing_line_color="#26a69a", decreasing_line_color="#ef5350",
+        showlegend=False,
+    ), row=1, col=1)
+
+    fig.add_trace(go.Scatter(x=dates, y=ma20, name="MA20",
+                             line=dict(color="#f59e0b", width=1.2)), row=1, col=1)
+    fig.add_trace(go.Scatter(x=dates, y=ma60, name="MA60",
+                             line=dict(color="#60a5fa", width=1.2)), row=1, col=1)
+    fig.add_trace(go.Scatter(x=dates, y=bb_u, name="BB",
+                             line=dict(color="rgba(147,51,234,0.55)", width=1, dash="dot"),
+                             showlegend=True), row=1, col=1)
+    fig.add_trace(go.Scatter(x=dates, y=bb_l,
+                             line=dict(color="rgba(147,51,234,0.55)", width=1, dash="dot"),
+                             fill="tonexty", fillcolor="rgba(147,51,234,0.05)",
+                             showlegend=False), row=1, col=1)
+    fig.add_trace(go.Scatter(x=dates, y=st_line, name="ST",
+                             line=dict(color="rgba(255,255,255,0.3)", width=1, dash="dot"),
+                             showlegend=False), row=1, col=1)
+
+    # UP/DOWN 어노테이션 (font size ∝ |score|)
+    for idx in dates[up_signals]:
+        sz = int(np.clip(9 + abs(score[idx]), 9, 16))
+        fig.add_annotation(x=idx, y=float(low[idx]) * 0.995,
+                           text="▲ UP", showarrow=False,
+                           font=dict(color="#00e676", size=sz, family="Arial Black"),
+                           row=1, col=1)
+    for idx in dates[dn_signals]:
+        sz = int(np.clip(9 + abs(score[idx]), 9, 16))
+        fig.add_annotation(x=idx, y=float(high[idx]) * 1.005,
+                           text="▼ DOWN", showarrow=False,
+                           font=dict(color="#ff5252", size=sz, family="Arial Black"),
+                           row=1, col=1)
+
+    # RSI
+    fig.add_trace(go.Scatter(x=dates, y=rsi, line=dict(color="#a78bfa", width=1.5),
+                             name="RSI", showlegend=False), row=2, col=1)
+    fig.add_hline(y=70, line_dash="dot", line_color="rgba(239,83,80,0.5)",  row=2, col=1)
+    fig.add_hline(y=50, line_dash="dot", line_color="rgba(255,255,255,0.2)", row=2, col=1)
+    fig.add_hline(y=30, line_dash="dot", line_color="rgba(38,166,154,0.5)", row=2, col=1)
+
+    # MACD
+    bar_clr = ["#26a69a" if v >= 0 else "#ef5350" for v in hist_macd.fillna(0)]
+    fig.add_trace(go.Bar(x=dates, y=hist_macd, marker_color=bar_clr,
+                         name="Hist", showlegend=False), row=3, col=1)
+    fig.add_trace(go.Scatter(x=dates, y=macd_line, line=dict(color="#60a5fa", width=1),
+                             name="MACD", showlegend=False), row=3, col=1)
+    fig.add_trace(go.Scatter(x=dates, y=sig_line, line=dict(color="#f59e0b", width=1),
+                             name="Signal", showlegend=False), row=3, col=1)
+
+    # Bollinger %B
+    fig.add_trace(go.Scatter(x=dates, y=bb_pct, line=dict(color="#c084fc", width=1.5),
+                             name="BB%B", showlegend=False), row=4, col=1)
+    fig.add_hline(y=1.0, line_dash="dot", line_color="rgba(239,83,80,0.5)",  row=4, col=1)
+    fig.add_hline(y=0.5, line_dash="dot", line_color="rgba(255,255,255,0.2)", row=4, col=1)
+    fig.add_hline(y=0.0, line_dash="dot", line_color="rgba(38,166,154,0.5)", row=4, col=1)
+
+    # Stochastic
+    fig.add_trace(go.Scatter(x=dates, y=stoch_k, line=dict(color="#f472b6", width=1.5),
+                             name="%K", showlegend=False), row=5, col=1)
+    fig.add_trace(go.Scatter(x=dates, y=stoch_d, line=dict(color="#fb923c", width=1),
+                             name="%D", showlegend=False), row=5, col=1)
+    fig.add_hline(y=80, line_dash="dot", line_color="rgba(239,83,80,0.5)",  row=5, col=1)
+    fig.add_hline(y=20, line_dash="dot", line_color="rgba(38,166,154,0.5)", row=5, col=1)
+
+    # CCI
+    cci_clr = ["#26a69a" if v >= 0 else "#ef5350" for v in cci.fillna(0)]
+    fig.add_trace(go.Bar(x=dates, y=cci, marker_color=cci_clr,
+                         name="CCI", showlegend=False), row=6, col=1)
+    fig.add_hline(y=100,  line_dash="dot", line_color="rgba(239,83,80,0.5)",  row=6, col=1)
+    fig.add_hline(y=-100, line_dash="dot", line_color="rgba(38,166,154,0.5)", row=6, col=1)
+
+    # ADX
+    fig.add_trace(go.Scatter(x=dates, y=adx,      line=dict(color="#fbbf24", width=1.8),
+                             name="ADX", showlegend=False), row=7, col=1)
+    fig.add_trace(go.Scatter(x=dates, y=plus_di,  line=dict(color="#34d399", width=1),
+                             name="+DI", showlegend=False), row=7, col=1)
+    fig.add_trace(go.Scatter(x=dates, y=minus_di, line=dict(color="#f87171", width=1),
+                             name="-DI", showlegend=False), row=7, col=1)
+    fig.add_hline(y=25, line_dash="dot", line_color="rgba(255,255,255,0.2)", row=7, col=1)
+
+    fig.update_layout(
+        title=dict(text=f"{ticker} — Multi Lens (일봉)", font=dict(size=15)),
+        paper_bgcolor="#0a0a0a", plot_bgcolor="#0d1117",
+        font_color="white", height=920,
+        xaxis_rangeslider_visible=False,
+        legend=dict(orientation="h", y=1.01, x=0, font=dict(size=11)),
+        margin=dict(t=55, b=10, l=10, r=10),
+    )
+    for r in range(1, 8):
+        fig.update_xaxes(showgrid=False, row=r, col=1)
+        fig.update_yaxes(showgrid=True, gridcolor="#1e1e2e", row=r, col=1)
+    fig.update_yaxes(range=[0, 100], row=2, col=1)
+    fig.update_yaxes(range=[0, 100], row=5, col=1)
+    fig.update_xaxes(rangeslider_visible=False)
+
+    st.plotly_chart(fig, use_container_width=True)
+
+
 # ── 한국 티커 자동 처리 ────────────────────────────────────────────────────────
 
 import re
@@ -1050,6 +1454,32 @@ if run_btn or _ticker_val:
     fig.update_yaxes(title_text="RSI", row=2, col=1, range=[0, 100])
 
     st.plotly_chart(fig, use_container_width=True)
+
+    # ── Trend Vision / Multi Lens 탭 ─────────────────────────────────────────
+    st.divider()
+    tab_tv, tab_ml = st.tabs(["📈 Trend Vision (주봉)", "📉 Multi Lens (일봉)"])
+
+    with tab_tv:
+        with st.spinner("Trend Vision 차트 생성 중..."):
+            if interval == "1wk":
+                hist_tv = hist
+            else:
+                hist_tv = yf.Ticker(resolved).history(period="5y", interval="1wk")
+            if hist_tv.empty:
+                st.warning("주봉 데이터를 가져올 수 없습니다.")
+            else:
+                render_trend_vision(resolved, hist_tv)
+
+    with tab_ml:
+        with st.spinner("Multi Lens 차트 생성 중..."):
+            if interval == "1d":
+                hist_ml = hist
+            else:
+                hist_ml = yf.Ticker(resolved).history(period="2y", interval="1d")
+            if hist_ml.empty:
+                st.warning("일봉 데이터를 가져올 수 없습니다.")
+            else:
+                render_multi_lens(resolved, hist_ml)
 
     # ── TabPFN-TS + LightGBM 가격 예측 ──────────────────────────────────────
     with st.expander("🔮 TabPFN-TS + LightGBM 가격 예측 (AI)"):

@@ -17,11 +17,6 @@ try:
 except ImportError:
     TABPFN_AVAILABLE = False
 
-try:
-    import lightgbm  # noqa: F401
-    LGBM_AVAILABLE = True
-except ImportError:
-    LGBM_AVAILABLE = False
 
 st.set_page_config(
     page_title="RSI 타겟 가격 계산기",
@@ -561,132 +556,6 @@ def run_tabpfn_forecast(
     except Exception as e:
         return None, None, f"❌ 예측 실패 (tabpfn-time-series {ver_str} 구버전): {e}"
 
-
-# ── LightGBM 분위수 회귀 예측 ─────────────────────────────────────────────────
-
-def run_lgbm_forecast(
-    close: pd.Series,
-    hist: pd.DataFrame,
-    pred_len: int,
-    interval: str,
-    period_rsi: int = 14,
-) -> tuple:
-    """
-    LightGBM 분위수 회귀 예측.
-    Returns (pred_df, hist_pred_df, error_msg)
-    pred_df 컬럼: timestamp, 0.1, 0.25, 0.5, 0.75, 0.9
-    """
-    try:
-        import lightgbm as lgb
-    except ImportError:
-        return None, None, "❌ lightgbm 미설치. requirements.txt에 `lightgbm>=4.0.0` 추가 필요."
-
-    QUANTILES = [0.1, 0.25, 0.5, 0.75, 0.9]
-
-    close_clean = close.dropna()
-    if len(close_clean) < 50:
-        return None, None, "❌ 데이터 부족 (최소 50봉 필요)."
-
-    # 피처 생성 (기존 build_features 재사용)
-    feat_df = build_features(hist, period_rsi)
-    common = close_clean.index.intersection(feat_df.index)
-    c = close_clean.loc[common]
-    f = feat_df.loc[common]
-
-    # NaN 50% 이상 컬럼 제거 (조회 기간 짧을 때 MA200 등 대응)
-    f = f.dropna(axis=1, thresh=max(1, len(f) // 2))
-    f = f.fillna(0)
-
-    # 최근 2000봉으로 제한 (인트라데이 대용량 대응)
-    if len(c) > 2000:
-        c = c.iloc[-2000:]
-        f = f.iloc[-2000:]
-
-    c_arr = c.values.astype(np.float64)
-    f_arr = f.values.astype(np.float32)
-    n = len(c_arr)
-
-    if n < pred_len + 10:
-        return None, None, f"❌ 학습 데이터 부족 ({n}봉). 조회 기간을 늘려주세요."
-
-    # Stacked horizon 학습셋 구성
-    # y = log(close[t+h] / close[t]), horizon=h 를 피처로 추가
-    X_rows, y_rows = [], []
-    for h in range(1, pred_len + 1):
-        for i in range(n - h):
-            if c_arr[i] <= 0:
-                continue
-            log_ret = np.log(c_arr[i + h] / c_arr[i])
-            if not np.isfinite(log_ret):
-                continue
-            X_rows.append(np.append(f_arr[i], float(h)))
-            y_rows.append(log_ret)
-
-    if len(X_rows) < 30:
-        return None, None, "❌ 유효 학습 샘플 부족."
-
-    X_train = np.array(X_rows, dtype=np.float32)
-    y_train = np.array(y_rows, dtype=np.float32)
-
-    # 5개 분위수 모델 학습
-    params_base = dict(
-        objective="quantile",
-        n_estimators=200,
-        learning_rate=0.05,
-        num_leaves=31,
-        min_child_samples=20,
-        subsample=0.8,
-        colsample_bytree=0.8,
-        verbosity=-1,
-        n_jobs=-1,
-    )
-    models = {}
-    for q in QUANTILES:
-        m = lgb.LGBMRegressor(**{**params_base, "alpha": q})
-        m.fit(X_train, y_train)
-        models[q] = m
-
-    # 미래 pred_len 스텝 예측
-    last_feat = f_arr[-1].astype(np.float32)
-    last_price = float(c_arr[-1])
-    pred_rows = []
-    for h in range(1, pred_len + 1):
-        x_pred = np.append(last_feat, float(h)).reshape(1, -1)
-        raw = [float(models[q].predict(x_pred)[0]) for q in QUANTILES]
-        raw.sort()  # Quantile crossing 방지
-        pred_rows.append([last_price * np.exp(v) for v in raw])
-
-    future = _future_dates(close_clean.index[-1], pred_len, interval)
-    pred_df = pd.DataFrame(pred_rows, columns=["0.1", "0.25", "0.5", "0.75", "0.9"])
-    pred_df.insert(0, "timestamp", future[:pred_len])
-
-    # 과거 검증: 마지막 pred_len 구간을 재예측해 실제가와 비교
-    hist_pred_df = None
-    if n > pred_len + 10:
-        hist_rows = []
-        start_idx = n - pred_len - 1
-        for h in range(1, pred_len + 1):
-            idx = start_idx + (h - 1)
-            if idx < 0 or idx >= n - 1:
-                break
-            x_p = np.append(f_arr[idx], float(h)).reshape(1, -1)
-            med_ret = float(models[0.5].predict(x_p)[0])
-            hist_rows.append(float(c_arr[idx]) * np.exp(med_ret))
-
-        if hist_rows:
-            hist_dates = close_clean.index[-pred_len: -pred_len + len(hist_rows)]
-            if len(hist_dates) == 0:
-                hist_dates = close_clean.index[-len(hist_rows):]
-            try:
-                hd = pd.DatetimeIndex(hist_dates).tz_localize(None)
-            except TypeError:
-                hd = pd.DatetimeIndex(hist_dates).tz_convert(None)
-            hist_pred_df = pd.DataFrame({
-                "timestamp": hd[:len(hist_rows)],
-                "0.5": hist_rows,
-            })
-
-    return pred_df, hist_pred_df, None
 
 
 # ── Trend Vision / Multi Lens 지표 헬퍼 ──────────────────────────────────────
@@ -1481,8 +1350,8 @@ if run_btn or _ticker_val:
             else:
                 render_multi_lens(resolved, hist_ml)
 
-    # ── TabPFN-TS + LightGBM 가격 예측 ──────────────────────────────────────
-    with st.expander("🔮 TabPFN-TS + LightGBM 가격 예측 (AI)"):
+    # ── TabPFN-TS 가격 예측 ──────────────────────────────────────────────────
+    with st.expander("🔮 TabPFN-TS 가격 예측 (AI)"):
         col_h, col_btn = st.columns([3, 1])
         horizon_opts_bars = {"4봉": 4, "8봉": 8, "12봉": 12, "26봉": 26, "52봉": 52}
         horizon_label = col_h.selectbox("예측 기간 (봉 수)", list(horizon_opts_bars.keys()), index=2)
@@ -1490,13 +1359,6 @@ if run_btn or _ticker_val:
         run_forecast = col_btn.button("예측 실행", type="primary", use_container_width=True)
 
         if run_forecast:
-            # ── LightGBM 예측 (항상 실행)
-            lgbm_pred_df = lgbm_hist_df = lgbm_err = None
-            with st.spinner("LightGBM 예측 중..."):
-                lgbm_pred_df, lgbm_hist_df, lgbm_err = run_lgbm_forecast(
-                    close, hist, horizon_bars, interval, period_rsi
-                )
-
             # ── TabPFN-TS 예측 (토큰 있을 때만)
             tabpfn_pred_df = tabpfn_hist_df = tabpfn_err = None
             tabpfn_token = None
@@ -1577,82 +1439,32 @@ if run_btn or _ticker_val:
 
             hist_show = close.iloc[-120:]
 
-            # ── 탭별 표시
-            tab_lgbm, tab_tabpfn = st.tabs(["📊 LightGBM", "🌐 TabPFN-TS"])
-
-            with tab_lgbm:
-                if lgbm_err:
-                    st.error(lgbm_err)
-                elif lgbm_pred_df is None:
-                    st.error("LightGBM 예측 결과가 없습니다.")
-                else:
-                    _render_table(lgbm_pred_df)
-                    fig_l = go.Figure()
-                    fig_l.add_trace(go.Scatter(x=hist_show.index, y=hist_show.values,
-                                               name="실제가", line=dict(color="#ffffff", width=1.5)))
-                    _lx = _add_fan(fig_l, lgbm_pred_df, lgbm_hist_df,
-                                   "#64a0ff", "rgba(100,160,255,0.15)", "rgba(100,160,255,0.30)", "LightGBM")
-                    fig_l.add_shape(type="line",
-                                    x0=close.index[-1],
-                                    x1=_lx.iloc[0] if hasattr(_lx, "iloc") else _lx[0],
-                                    y0=current_price, y1=current_price,
-                                    line=dict(color="#ffeb3b", width=1, dash="dot"))
-                    fig_l.update_layout(template="plotly_dark", paper_bgcolor="#000000",
-                                        plot_bgcolor="#000000", height=420,
-                                        title=f"LightGBM 예측 ({horizon_bars}봉)",
-                                        margin=dict(l=10, r=10, t=40, b=10),
-                                        legend=dict(orientation="h"))
-                    st.plotly_chart(fig_l, use_container_width=True)
-
-            with tab_tabpfn:
-                if not tabpfn_token:
-                    st.info("Streamlit Secrets에 `TABPFN_API_TOKEN`을 추가하면 TabPFN-TS 예측을 사용할 수 있습니다.")
-                elif ts_major < 1:
-                    st.warning(f"tabpfn-time-series {ts_ver_str} — v1.0.9 이상 필요.")
-                elif tabpfn_err:
-                    st.error(tabpfn_err)
-                elif tabpfn_pred_df is None:
-                    st.error("TabPFN-TS 예측 결과가 없습니다.")
-                else:
-                    _render_table(tabpfn_pred_df)
-                    fig_t = go.Figure()
-                    fig_t.add_trace(go.Scatter(x=hist_show.index, y=hist_show.values,
-                                               name="실제가", line=dict(color="#ffffff", width=1.5)))
-                    _tx = _add_fan(fig_t, tabpfn_pred_df, tabpfn_hist_df,
-                                   "#69f0ae", "rgba(100,255,160,0.15)", "rgba(100,255,160,0.30)", "TabPFN-TS")
-                    fig_t.add_shape(type="line",
-                                    x0=close.index[-1],
-                                    x1=_tx.iloc[0] if hasattr(_tx, "iloc") else _tx[0],
-                                    y0=current_price, y1=current_price,
-                                    line=dict(color="#ffeb3b", width=1, dash="dot"))
-                    fig_t.update_layout(template="plotly_dark", paper_bgcolor="#000000",
-                                        plot_bgcolor="#000000", height=420,
-                                        title=f"TabPFN-TS 예측 ({horizon_bars}봉)",
-                                        margin=dict(l=10, r=10, t=40, b=10),
-                                        legend=dict(orientation="h"))
-                    st.plotly_chart(fig_t, use_container_width=True)
-
-            # ── 두 모델 모두 성공 시 통합 비교 차트
-            if lgbm_pred_df is not None and tabpfn_pred_df is not None and not tabpfn_err:
-                st.markdown("#### 📈 LightGBM vs TabPFN-TS 비교")
-                fig_cmp = go.Figure()
-                fig_cmp.add_trace(go.Scatter(x=hist_show.index, y=hist_show.values,
-                                             name="실제가", line=dict(color="#ffffff", width=1.5)))
-                _lx2 = _add_fan(fig_cmp, lgbm_pred_df, None,
-                                 "#64a0ff", "rgba(100,160,255,0.12)", "rgba(100,160,255,0.22)", "LightGBM")
-                _add_fan(fig_cmp, tabpfn_pred_df, None,
-                         "#69f0ae", "rgba(100,255,160,0.12)", "rgba(100,255,160,0.22)", "TabPFN-TS")
-                fig_cmp.add_shape(type="line",
-                                  x0=close.index[-1],
-                                  x1=_lx2.iloc[0] if hasattr(_lx2, "iloc") else _lx2[0],
-                                  y0=current_price, y1=current_price,
-                                  line=dict(color="#ffeb3b", width=1, dash="dot"))
-                fig_cmp.update_layout(template="plotly_dark", paper_bgcolor="#000000",
-                                      plot_bgcolor="#000000", height=450,
-                                      title=f"LightGBM vs TabPFN-TS ({horizon_bars}봉)",
-                                      margin=dict(l=10, r=10, t=40, b=10),
-                                      legend=dict(orientation="h"))
-                st.plotly_chart(fig_cmp, use_container_width=True)
+            if not tabpfn_token:
+                st.info("Streamlit Secrets에 `TABPFN_API_TOKEN`을 추가하면 TabPFN-TS 예측을 사용할 수 있습니다.")
+            elif ts_major < 1:
+                st.warning(f"tabpfn-time-series {ts_ver_str} — v1.0.9 이상 필요.")
+            elif tabpfn_err:
+                st.error(tabpfn_err)
+            elif tabpfn_pred_df is None:
+                st.error("TabPFN-TS 예측 결과가 없습니다.")
+            else:
+                _render_table(tabpfn_pred_df)
+                fig_t = go.Figure()
+                fig_t.add_trace(go.Scatter(x=hist_show.index, y=hist_show.values,
+                                           name="실제가", line=dict(color="#ffffff", width=1.5)))
+                _tx = _add_fan(fig_t, tabpfn_pred_df, tabpfn_hist_df,
+                               "#69f0ae", "rgba(100,255,160,0.15)", "rgba(100,255,160,0.30)", "TabPFN-TS")
+                fig_t.add_shape(type="line",
+                                x0=close.index[-1],
+                                x1=_tx.iloc[0] if hasattr(_tx, "iloc") else _tx[0],
+                                y0=current_price, y1=current_price,
+                                line=dict(color="#ffeb3b", width=1, dash="dot"))
+                fig_t.update_layout(template="plotly_dark", paper_bgcolor="#000000",
+                                    plot_bgcolor="#000000", height=420,
+                                    title=f"TabPFN-TS 예측 ({horizon_bars}봉)",
+                                    margin=dict(l=10, r=10, t=40, b=10),
+                                    legend=dict(orientation="h"))
+                st.plotly_chart(fig_t, use_container_width=True)
 
             st.caption("⚠️ 예측 결과는 참고용이며 투자 판단의 근거로 사용할 수 없습니다.")
 
